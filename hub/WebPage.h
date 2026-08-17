@@ -45,42 +45,102 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </table>
 
 <script>
+// idx -> { tr: <DOM-строка>, installed: bool } - хранится между вызовами
+// refresh(), чтобы не пересоздавать DOM-узлы (в т.ч. поля ввода)
+// на каждый тик автообновления.
+let rowsByIdx = {};
+
 async function refresh() {
   try {
     const res = await fetch('/api/devices');
     const devices = await res.json();
     const body = document.getElementById('devices-body');
+
     if (devices.length === 0) {
       body.innerHTML = '<tr><td colspan="7" class="empty">Устройств пока не видно</td></tr>';
+      rowsByIdx = {};
       return;
     }
-    body.innerHTML = '';
+
+    // Перед первым реальным наполнением убираем плейсхолдер
+    // ("Загрузка..."/"Устройств пока не видно").
+    if (Object.keys(rowsByIdx).length === 0) {
+      body.innerHTML = '';
+    }
+
+    const seenIdx = new Set();
+
     devices.forEach(d => {
-      const tr = document.createElement('tr');
+      seenIdx.add(d.idx);
       const isOpen = d.activeValve !== 0;
       const valveText = isOpen ? ('открыт #' + d.activeValve) : 'закрыт';
       const typeText = d.type === 1 ? 'полив' : ('тип ' + d.type);
       const statusText = d.installed ? 'установлено' : 'кандидат';
       const statusClass = d.installed ? 'status-installed' : 'status-candidate';
-      const installBtn = d.installed
-        ? ''
-        : '<button class="install-btn" onclick="installDevice(' + d.idx + ')">Установить</button>';
-      tr.innerHTML =
-        '<td>' + d.idx + '</td>' +
-        '<td>' + d.mac + '</td>' +
-        '<td>' + typeText + '</td>' +
-        '<td>' + d.agoSec + 'с назад</td>' +
-        '<td class="' + statusClass + '">' + statusText + '</td>' +
-        '<td class="' + (isOpen ? 'valve-open' : 'valve-closed') + '">' + valveText + '</td>' +
-        '<td>' +
-          '<input type="number" min="1" max="4" value="1" id="valve-' + d.idx + '"> клапан ' +
-          '<input type="number" min="1" value="10" id="sec-' + d.idx + '"> сек ' +
-          '<button onclick="openValve(' + d.idx + ')">Открыть</button>' +
-          '<button class="close-btn" onclick="closeValve(' + d.idx + ')">Закрыть</button>' +
-          installBtn +
-          '<button class="forget-btn" onclick="forgetDevice(' + d.idx + ', ' + d.installed + ')">Забыть</button>' +
-        '</td>';
-      body.appendChild(tr);
+
+      let row = rowsByIdx[d.idx];
+      if (!row) {
+        // Строка создаётся ОДИН раз на устройство. В частности, поля
+        // ввода (valve-N/sec-N) создаются здесь и больше никогда не
+        // трогаются - именно это чинит "стирание при вводе": раньше
+        // вся строка (вместе с input-ами) пересоздавалась заново на каждый
+        // тик автообновления.
+        const tr = document.createElement('tr');
+        tr.innerHTML =
+          '<td>' + d.idx + '</td>' +
+          '<td>' + d.mac + '</td>' +
+          '<td>' + typeText + '</td>' +
+          '<td class="conn"></td>' +
+          '<td class="status"></td>' +
+          '<td class="valve"></td>' +
+          '<td>' +
+            '<input type="number" min="1" max="4" value="1" id="valve-' + d.idx + '"> клапан ' +
+            '<input type="number" min="1" value="10" id="sec-' + d.idx + '"> сек ' +
+            '<button onclick="openValve(' + d.idx + ')">Открыть</button>' +
+            '<button class="close-btn" onclick="closeValve(' + d.idx + ')">Закрыть</button>' +
+            '<span class="install-slot"></span>' +
+            '<button class="forget-btn">Забыть</button>' +
+          '</td>';
+        body.appendChild(tr);
+        row = { tr: tr, installed: null };
+        rowsByIdx[d.idx] = row;
+      }
+
+      // Дальше - обновление ТОЛЬКО тех ячеек, что реально меняются
+      // (время связи, статус, состояние клапана). Поля ввода и кнопки
+      // не пересоздаются, поэтому не теряют введённое значение/фокус.
+      row.tr.querySelector('.conn').textContent = d.agoSec + 'с назад';
+
+      const statusCell = row.tr.querySelector('.status');
+      statusCell.textContent = statusText;
+      statusCell.className = 'status ' + statusClass;
+
+      const valveCell = row.tr.querySelector('.valve');
+      valveCell.textContent = valveText;
+      valveCell.className = 'valve ' + (isOpen ? 'valve-open' : 'valve-closed');
+
+      // Кнопку "Установить"/обработчик "Забыть" трогаем, только если
+      // статус installed реально изменился (редкое, инициируется
+      // пользователем) событие - не на каждый тик.
+      if (row.installed !== d.installed) {
+        row.installed = d.installed;
+        const installSlot = row.tr.querySelector('.install-slot');
+        installSlot.innerHTML = d.installed
+          ? ''
+          : '<button class="install-btn" onclick="installDevice(' + d.idx + ')">Установить</button>';
+        row.tr.querySelector('.forget-btn')
+          .setAttribute('onclick', 'forgetDevice(' + d.idx + ', ' + d.installed + ')');
+      }
+    });
+
+    // Устройство пропало из ответа (например, кто-то его забыл через
+    // другой клиент) - убираем его строку.
+    Object.keys(rowsByIdx).forEach(function (idxStr) {
+      const idx = Number(idxStr);
+      if (!seenIdx.has(idx)) {
+        rowsByIdx[idx].tr.remove();
+        delete rowsByIdx[idx];
+      }
     });
   } catch (e) {
     console.error('Не удалось обновить список устройств', e);
