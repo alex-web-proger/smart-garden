@@ -49,6 +49,17 @@
 // синхронизация при каждом запуске. Сейчас единственный источник времени
 // - браузер: страница веб-интерфейса при загрузке сама шлёт Хабу текущее
 // UTC-время (POST /api/settime). См. PROTOCOL.md §12.
+//
+// Как только Хаб получил время от браузера, он тут же разносит его дальше
+// по ESP-NOW всем периферийным узлам - тем же broadcast-пакетом MSG_CONFIG,
+// которым объявляет о своей (пере)загрузке (см. sendHubAnnounce()). Узлы
+// подхватывают его в GardenNode::handleIncoming() и выставляют свои собственные
+// часы - то же решение, что и у самого Хаба, просто на один шаг дальше по
+// цепочке источника времени.
+//
+// Время - МЕСТНОЕ, не UTC: его уже в таком виде отдаёт браузер (см. ниже и
+// WebPage.h) - Хаб просто хранит полученное значение как есть и никак его не
+// пересчитывает.
 
 #define MAX_DEVICES 64 // с запасом над плановыми 30-50 реальными устройствами
 
@@ -226,6 +237,27 @@ void printMac(const uint8_t *mac) {
     Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
+// --- Часы ---
+
+// Форматирует текущее время Хаба в читаемый вид - для Serial и
+// веб-интерфейса. Хранимое значение - МЕСТНОЕ время (его уже таким присылает
+// браузер, сдвинув свой часовой пояс перед отправкой, см. WebPage.h), поэтому
+// тут оно просто читается `gmtime_r()`-ом как есть, без какого-либо повторного
+// сдвига на стороне Хаба - использование именно `gmtime_r()`, а не `localtime_r()`,
+// здесь не означает "показываем UTC" - просто не тащим на ESP32 встроенную
+// систему перевода часовых поясов/DST, которая тут не нужна - пояс уже
+// учтён браузером до отправки (см. PROTOCOL.md §12).
+String currentTimeString() {
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    gmtime_r(&now, &timeinfo);
+    char buf[20];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+              timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+              timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    return String(buf);
+}
+
 // Заголовок исходящего пакета. receiverMac - конкретный узел (для команды),
 // не HUB_MAC (тот зарезервирован под адресацию Хаба). Сама механика
 // заполнения полей — общая для всех отправителей (см. fillPacketHeader()
@@ -243,10 +275,20 @@ void prepareHeader(MsgType mType, const uint8_t *receiverMac) {
 // "старые" (см. PROTOCOL.md §4.3). Шлём несколько раз с паузой на случай
 // потери одного пакета в эфире/через репку - это не бесконечный повтор,
 // а короткая пачка сразу при старте.
+//
+// Тем же пакетом Хаб разносит по сети своё текущее время (поле
+// payload.hub.epoch, 0 если сам ещё не синхронизирован) - узлы подхватывают
+// его в GardenNode::handleIncoming() и выставляют свои часы (см. PROTOCOL.md §12).
+// Вызывается не только при загрузке Хаба, но и повторно из
+// handleApiSetTime() при каждой успешной синхронизации от браузера - чтобы
+// уже работающие узлы получали время сразу, не дожидаясь своего
+// собственного очередного MSG_CONFIG (база ~1 час) или перезагрузки Хаба.
 void sendHubAnnounce() {
     prepareHeader(MSG_CONFIG, BROADCAST_MAC);
+    txPacket.payload.hub.epoch = timeSynced ? (uint32_t) time(nullptr) : 0;
     esp_now_send(BROADCAST_MAC, (uint8_t *) &txPacket, sizeof(txPacket));
-    Serial.printf("Sent: HUB ANNOUNCE (boot), packet_id=%u\n", txPacket.packet_id);
+    Serial.printf("Sent: HUB ANNOUNCE, packet_id=%u, epoch=%lu\n",
+                  txPacket.packet_id, (unsigned long) txPacket.payload.hub.epoch);
 }
 
 void sendCommand(int deviceIdx, uint8_t targetValve, uint8_t mode, uint16_t durationSec, uint16_t volumeL) {
@@ -308,6 +350,16 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
     // "старыми" относительно уже виденных ранее номеров (см. GardenProtocol.h).
     if (rxPacket.msg_type == MSG_CONFIG) {
         devices[idx].lastSeenPacketId = 0;
+
+        // Узел только что (пере)загрузился - его часы сброшены на 1970-01-01
+        // (у него нет RTC, см. PROTOCOL.md §12.6). Не ждём его собственного очередного
+        // MSG_CONFIG (база ~1 час) или своей очередной пересинхронизации страницы с
+        // браузером (до 30 минут) - сразу же отвечаем текущим временем тем же
+        // broadcast-announce, что и так рассылается при (пере)загрузке/синхронизации
+        // самого Хаба (см. sendHubAnnounce()) - отдельного механизма под это не
+        // потребовалось. Если сам Хаб ещё не синхронизирован, epoch в announce
+        // будет 0 - узел это корректно обработает (часы не трогает, см. §12.6).
+        sendHubAnnounce();
     }
 
     if (!isNewerPacketId(rxPacket.packet_id, devices[idx].lastSeenPacketId)) {
@@ -364,6 +416,7 @@ void listDevices() {
 //   close <idx>                   - закрыть все клапаны устройства
 //   install <idx>                 - подтвердить устройство, защитить от вытеснения, сохранить в NVS
 //   forget <idx>                  - удалить устройство (установленное или нет) из таблицы и NVS
+//   time                          - показать текущее время Хаба и статус синхронизации с браузером
 void handleSerialCommand(String line) {
     line.trim();
     if (line.length() == 0) return;
@@ -421,9 +474,21 @@ void handleSerialCommand(String line) {
         } else {
             Serial.println("Использование: forget <idx>");
         }
+    } else if (cmd == "time") {
+        // Смотреть результат синхронизации не только в момент самого
+        // POST /api/settime (та строка быстро уходит вверх по Serial
+        // Monitor), а по запросу в любой момент - тот же timeSynced и
+        // currentTimeString(), что отдаёт и GET /api/status.
+        if (timeSynced) {
+            Serial.print("Время Хаба синхронизировано с браузером: ");
+            Serial.println(currentTimeString());
+        } else {
+            Serial.println("Время Хаба ещё НЕ синхронизировано - ждём загрузки веб-страницы "
+                            "в браузере (см. PROTOCOL.md §12).");
+        }
     } else {
         Serial.println("Команды: list | open <idx> <valve> <sec> | volume <idx> <valve> <liters> | "
-                        "close <idx> | install <idx> | forget <idx>");
+                        "close <idx> | install <idx> | forget <idx> | time");
     }
 }
 
@@ -521,6 +586,46 @@ void handleApiForget() {
     server.send(200, "text/plain", "ok");
 }
 
+// POST /api/settime - form-urlencoded: epoch (целое число секунд, МЕСТНОЕ время браузера,
+// уже со сдвигом на часовой пояс, не UTC - см. localEpochSeconds() в WebPage.h).
+// Вызывается автоматически самим веб-интерфейсом при каждой
+// загрузке страницы в браузере (см. WebPage.h, syncTime()).
+void handleApiSetTime() {
+    if (!server.hasArg("epoch")) {
+        server.send(400, "text/plain", "missing epoch");
+        return;
+    }
+    time_t epoch = (time_t) server.arg("epoch").toInt();
+    struct timeval tv;
+    tv.tv_sec = epoch;
+    tv.tv_usec = 0;
+    settimeofday(&tv, nullptr);
+    timeSynced = true;
+    Serial.print("Часы синхронизированы с браузером: "); Serial.println(currentTimeString());
+
+    // Сразу же разносим новое время по ESP-NOW всем периферийным узлам -
+    // чтобы уже работающие узлы получили время сразу, не дожидаясь своего
+    // собственного очередного MSG_CONFIG (база ~1 час) или перезагрузки Хаба.
+    // Срабатывает это же при каждой повторной синхронизации страницы раз в 30 минут
+    // (см. WebPage.h) - попутно тоже компенсирует дрейф часов узлов, не только Хаба.
+    sendHubAnnounce();
+
+    server.send(200, "text/plain", "ok");
+}
+
+// GET /api/status - служебная информация Хаба, сейчас только про часы -
+// веб-страница опрашивает это в том же цикле автообновления, что и
+// /api/devices, чтобы показать оператору визуальное подтверждение, что
+// синхронизация времени сработала.
+void handleApiStatus() {
+    String json = "{";
+    json += "\"timeSynced\":" + String(timeSynced ? "true" : "false");
+    json += ",\"epoch\":" + String((unsigned long) time(nullptr));
+    json += ",\"timeString\":\"" + currentTimeString() + "\"";
+    json += "}";
+    server.send(200, "application/json", json);
+}
+
 void setup() {
     Serial.begin(115200);
 
@@ -562,11 +667,13 @@ void setup() {
     server.on("/api/command", HTTP_POST, handleApiCommand);
     server.on("/api/install", HTTP_POST, handleApiInstall);
     server.on("/api/forget", HTTP_POST, handleApiForget);
+    server.on("/api/settime", HTTP_POST, handleApiSetTime);
+    server.on("/api/status", HTTP_GET, handleApiStatus);
     server.begin();
     Serial.println("Веб-сервер запущен.");
 
     Serial.println("Serial-команды: list | open <idx> <valve> <sec> | volume <idx> <valve> <liters> | "
-                    "close <idx> | install <idx> | forget <idx>");
+                    "close <idx> | install <idx> | forget <idx> | time");
 
     // Объявляем о своей (пере)загрузке всем узлам сети - см. sendHubAnnounce().
     // Несколько повторов с паузой, а не один пакет, на случай потерь в эфире.

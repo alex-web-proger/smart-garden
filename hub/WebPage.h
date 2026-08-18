@@ -21,6 +21,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   body { font-family: -apple-system, sans-serif; margin: 16px; background:#f6f6f2; color:#222; }
   h1 { font-size: 1.2em; margin-bottom: 4px; }
   .sub { color:#777; font-size: 0.85em; margin-bottom: 16px; }
+  #time-status { font-size: 0.85em; margin-bottom: 12px; }
+  .time-synced { color:#2a7d2a; }
+  .time-unsynced { color:#b8860b; }
   table { width:100%; border-collapse: collapse; background:#fff; border-radius:8px; overflow:hidden; }
   th, td { padding: 10px 8px; border-bottom: 1px solid #eee; text-align:left; font-size: 0.85em; vertical-align: middle; }
   th { background:#eef4ea; }
@@ -39,6 +42,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <body>
 <h1>Smart Garden — Хаб</h1>
 <div class="sub">Автообновление каждые 2 сек. "Кандидат" — обнаружен по трафику, может быть вытеснен. "Установлено" — подтверждено, сохранено, защищено от вытеснения.</div>
+<div id="time-status" class="time-unsynced">Синхронизация времени...</div>
 <table>
   <thead><tr><th>#</th><th>MAC</th><th>Тип</th><th>Связь</th><th>Статус</th><th>Клапан</th><th>Управление</th></tr></thead>
   <tbody id="devices-body"><tr><td colspan="7" class="empty">Загрузка...</td></tr></tbody>
@@ -188,8 +192,74 @@ async function forgetDevice(idx, installed) {
   setTimeout(refresh, 300);
 }
 
+// Хаб не имеет RTC-модуля с батарейкой - его часы (time()/settimeofday())
+// сбрасываются на 1970-01-01 при каждой перезагрузке. Нужно МЕСТНОЕ
+// время (читаемые метки в логах/статусе), а не UTC - поэтому страница
+// сдвигает Date.now() на местный часовой пояс браузера (getTimezoneOffset())
+// перед отправкой и шлёт уже готовое "местное" значение. Хаб просто
+// хранит его как есть (вся арифметика с поясом/DST - на стороне браузера, не
+// встраиваемой системы - тот же принцип, что и раньше). См. PROTOCOL.md §12.
+function localEpochSeconds() {
+  const now = new Date();
+  const utcSeconds = Math.floor(now.getTime() / 1000);
+  if (typeof now.getTimezoneOffset === 'function') {
+    // getTimezoneOffset() - разница UTC-местное в минутах (положительная для
+    // поясов западнее UTC, отрицательная для восточнее) - именно
+    // поэтому здесь вычитание, а не сложение.
+    return utcSeconds - now.getTimezoneOffset() * 60;
+  }
+  // Фоллбэк на случай, если браузер вдруг не поддержал стандартный метод
+  // Date.getTimezoneOffset() (в любом современном браузере он есть, это чисто защита
+  // на самый крайний случай) - считаем часовой пояс Киева: летом (как сейчас)
+  // UTC+3 (EEST), зимой UTC+2 (EET) - без доступа к getTimezoneOffset() DST-переход
+  // отследить нечем, поэтому берём летнее значение как более вероятное большую
+  // часть сезона выращивания.
+  const KYIV_SUMMER_OFFSET_SECONDS = 3 * 3600;
+  return utcSeconds + KYIV_SUMMER_OFFSET_SECONDS;
+}
+
+async function syncTime() {
+  try {
+    await fetch('/api/settime', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'epoch=' + localEpochSeconds()
+    });
+  } catch (e) {
+    console.error('Не удалось синхронизировать время', e);
+  }
+  // Статус обновляем сразу после попытки синхронизации, не дожидаясь
+  // следующего тика refreshStatus() - иначе индикатор до 2 сек показывал
+  // бы старое (не)синхронизированное состояние.
+  refreshStatus();
+}
+
+async function refreshStatus() {
+  try {
+    const res = await fetch('/api/status');
+    const status = await res.json();
+    const el = document.getElementById('time-status');
+    if (status.timeSynced) {
+      el.textContent = 'Время Хаба: ' + status.timeString;
+      el.className = 'time-synced';
+    } else {
+      el.textContent = 'Время Хаба не синхронизировано (ожидание браузера)';
+      el.className = 'time-unsynced';
+    }
+  } catch (e) {
+    console.error('Не удалось получить статус Хаба', e);
+  }
+}
+
+syncTime();
 refresh();
 setInterval(refresh, 2000);
+setInterval(refreshStatus, 2000);
+// Периодическая пересинхронизация: часы ESP32 без внешнего RTC понемногу
+// уходят (обычный дрейф кварцевого генератора). Раз в 30 минут, пока
+// страница открыта, поправляем их заново - недорого и не требует участия
+// оператора.
+setInterval(syncTime, 1800000);
 </script>
 </body>
 </html>

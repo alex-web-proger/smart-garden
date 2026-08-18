@@ -1,5 +1,7 @@
 #pragma once
 #include <Arduino.h>
+#include <time.h>
+#include <sys/time.h>
 #include "GardenProtocol.h"
 
 // Переиспользуемая логика ПЕРИФЕРИЙНОГО узла (не Хаба): подготовка
@@ -79,6 +81,24 @@ public:
     void armWatchdog();
     void disarmWatchdog();
 
+    // Часы узла синхронизируются автоматически, без участия скетча:
+    // узел не ведёт собственный часовой источник - время приходит попутно
+    // с каждым broadcast-объявлением Хаба о (пере)загрузке (device_type==TYPE_HUB,
+    // msg_type==MSG_CONFIG) - тот же broadcast-пакет, что уже используется для
+    // сброса dedup (см. handleIncoming()) - никакого отдельного MsgType под это
+    // заводить не потребовалось. См. PROTOCOL.md §12.
+    //
+    // Если Хаб сам ещё не синхронизирован с браузером, его announce несёт
+    // epoch=0 - в этом случае часы узла не трогаются и остаются не
+    // синхронизированными (isTimeSynced() вернёт false).
+    bool isTimeSynced() const { return timeSynced; }
+
+    // Текущее время узла (UTC) в читаемом виде - для Serial-лога. Если
+    // isTimeSynced()==false, отражает реальные (бессмысленные) показания часов
+    // платформы (обычно около 1970-01-01) - вызывающий код должен проверять
+    // флаг отдельно, если это важно.
+    String currentTimeString() const;
+
     // Отправить MSG_TELEMETRY ПРЯМО СЕЙЧАС, не дожидаясь периодического
     // таймера из loop(). Нужен для событийных устройств (например,
     // кнопки) - вызвать сразу в момент события, а не ждать следующего
@@ -122,6 +142,7 @@ private:
 
     unsigned long lastHubContactTime = 0;
     bool watchdogArmed = false;
+    bool timeSynced = false; // true - хотя бы один раз получили epoch!=0 в announce от Хаба
 
     UniversalPacket txPacket;
 

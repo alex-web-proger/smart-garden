@@ -112,6 +112,22 @@ void GardenNode::handleIncoming(const UniversalPacket &packet) {
     if (packet.device_type == TYPE_HUB && packet.msg_type == MSG_CONFIG) {
         lastReceivedCommandId = 0;
         Serial.println("Hub объявил о (пере)загрузке - dedup сброшен");
+
+        // Тем же пакетом Хаб мог разнести своё текущее время (см.
+        // PROTOCOL.md §12). epoch==0 - валидное значение "Хаб сам ещё не
+        // синхронизирован", а не ошибка - в этом случае часы узла не
+        // трогаем, чтобы не затереть уже возможно валидное время, полученное
+        // ранее (например, если Хаб перезагрузился и ещё не успел 
+        // пересинхронизироваться с браузером заново).
+        uint32_t epoch = packet.payload.hub.epoch;
+        if (epoch != 0) {
+            struct timeval tv;
+            tv.tv_sec = (time_t) epoch;
+            tv.tv_usec = 0;
+            settimeofday(&tv, nullptr);
+            timeSynced = true;
+            Serial.print("Часы узла синхронизированы с Хабом: "); Serial.println(currentTimeString());
+        }
     }
 
     // 3. Дедупликация с учётом переполнения uint16_t.
@@ -139,4 +155,19 @@ void GardenNode::armWatchdog() {
 
 void GardenNode::disarmWatchdog() {
     watchdogArmed = false;
+}
+
+// UTC, симметрично Hub::currentTimeString() в hub.ino - тот же формат вывода,
+// чтобы логи Хаба и узла читались одинаково. Не привязываемся к местному
+// часовому поясу по той же причине: не тащить на встраиваемую систему
+// перевод часовых поясов/DST.
+String GardenNode::currentTimeString() const {
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    gmtime_r(&now, &timeinfo);
+    char buf[25];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d UTC",
+              timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+              timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    return String(buf);
 }

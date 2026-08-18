@@ -13,7 +13,7 @@
 // именно этих GPIO - см. PROTOCOL.md §6.1.
 const uint8_t valvePins[VALVE_COUNT] = {5, 4, 14, 12};
 
-#define WATCHDOG_TIMEOUT_MS 30000UL
+#define WATCHDOG_TIMEOUT_MS 300000UL
 #define TELEMETRY_INTERVAL_MS 10000UL
 #define TELEMETRY_JITTER_MS 2000UL
 #define CONFIG_INTERVAL_MS 3600000UL
@@ -32,10 +32,18 @@ void applyValveState(uint8_t valve) {
     }
 }
 
+// Встроенный светодиод на плате (GPIO2, active LOW). Не используется для
+// клапанов — см. README — но удобен как индикатор передачи в эфир.
+#define STATUS_LED LED_BUILTIN
+
 // Транспорт - единственное, что зависит от платформы (ESP8266 vs ESP32),
 // поэтому живёт в скетче, а не в библиотеке.
 bool sendRaw(const uint8_t *data, size_t len) {
-    return esp_now_send(broadcastAddress, (uint8_t *) data, len) == 0;
+    digitalWrite(STATUS_LED, LOW);
+    bool ok = esp_now_send(broadcastAddress, (uint8_t *) data, len) == 0;
+    delay(50);
+    digitalWrite(STATUS_LED, HIGH);
+    return ok;
 }
 
 // --- Колбэки под конкретный домен устройства (полив) ---
@@ -86,6 +94,9 @@ void setup() {
 
     for (uint8_t i = 0; i < VALVE_COUNT; i++) pinMode(valvePins[i], OUTPUT);
     applyValveState(0);
+
+    pinMode(STATUS_LED, OUTPUT);
+    digitalWrite(STATUS_LED, HIGH);
 
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
