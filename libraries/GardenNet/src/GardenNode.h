@@ -7,8 +7,10 @@
 // Переиспользуемая логика ПЕРИФЕРИЙНОГО узла (не Хаба): подготовка
 // заголовка, периодическая отправка MSG_CONFIG/MSG_TELEMETRY с
 // джиттером, приём и дедупликация входящих пакетов (включая сброс
-// dedup по announce-объявлению Хаба о перезагрузке), автоматическая
-// отправка MSG_ACK на команды, watchdog по таймауту связи.
+// dedup по announce-объявлению Хаба о перезагрузке и переотправку
+// СОБСТВЕННОГО MSG_CONFIG, если Хаб действительно перезагрузился - см.
+// handleIncoming()), автоматическая отправка MSG_ACK на команды,
+// watchdog по таймауту связи.
 //
 // Транспорт (esp_now_send/esp_now_init/регистрация recv-колбэка)
 // СОЗНАТЕЛЬНО остаётся в скетче, а не здесь - API esp-now отличается
@@ -38,6 +40,20 @@ public:
     // для автоматически отправляемого MSG_ACK: 0 - принято, 1 - отклонено.
     typedef uint8_t (*OnCommandFn)(const UniversalPacket &packet);
 
+    // Обработка входящего MSG_SET_CONFIG - новой желаемой конфигурации узла
+    // от Хаба. Симметрично OnCommandFn выше (тот же смысл возвращаемого статуса
+    // для авто-ACK), но отдельный тип/сеттер (а не пятый параметр
+    // в setCallbacks() ниже) - чтобы узлы, не принимающие конфигурацию с Хаба, могли
+    // просто не вызывать setConfigHandler() вовсе, не меняя сигнатуру setCallbacks() и
+    // не передавая туда лишний nullptr. Реализация должна сама проверить
+    // валидность значений (например, у flow_node - что valve_count укладывается
+    // в 1..MAX_VALVES её реальной распайки), ПРИМЕНИТЬ её НА СЕБЕ (EEPROM/аналог,
+    // переживающий перезагрузку) и вернуть 0. При 0 библиотека сама сразу же
+    // шлёт очередной MSG_CONFIG-эхо (см. handleIncoming() в .cpp) - уже с новыми
+    // значениями, которые fillConfigFn прочтёт из того же места, куда их только
+    // что применила эта функция.
+    typedef uint8_t (*OnSetConfigFn)(const UniversalPacket &packet);
+
     // Вызывается, когда watchdog сработал (armWatchdog() был вызван, но
     // валидных пакетов от Хаба не было дольше watchdogTimeoutMs).
     typedef void (*OnWatchdogFn)();
@@ -52,6 +68,10 @@ public:
     // команд).
     void setCallbacks(FillPayloadFn fillConfig, FillPayloadFn fillTelemetry,
                        OnCommandFn onCommand, OnWatchdogFn onWatchdog);
+
+    // Колбэк под MSG_SET_CONFIG - отдельный сеттер, а не пятый параметр в
+    // setCallbacks() выше - см. комментарий у OnSetConfigFn про причину.
+    void setConfigHandler(OnSetConfigFn onSetConfig);
 
     // Периоды отправки (базовое значение) и границы случайного джиттера
     // вокруг них - подробнее см. PROTOCOL.md §6.2 проекта Smart Garden.
@@ -93,7 +113,8 @@ public:
     // синхронизированными (isTimeSynced() вернёт false).
     bool isTimeSynced() const { return timeSynced; }
 
-    // Текущее время узла (UTC) в читаемом виде - для Serial-лога. Если
+    // Текущее время узла (МЕСТНОЕ, не UTC - таким его прислал браузер,
+    // см. PROTOCOL.md §12) в читаемом виде - для Serial-лога. Если
     // isTimeSynced()==false, отражает реальные (бессмысленные) показания часов
     // платформы (обычно около 1970-01-01) - вызывающий код должен проверять
     // флаг отдельно, если это важно.
@@ -124,6 +145,7 @@ private:
     FillPayloadFn fillConfigFn = nullptr;
     FillPayloadFn fillTelemetryFn = nullptr;
     OnCommandFn onCommandFn = nullptr;
+    OnSetConfigFn onSetConfigFn = nullptr;
     OnWatchdogFn onWatchdogFn = nullptr;
 
     unsigned long telemetryIntervalMs = 10000;
@@ -134,6 +156,13 @@ private:
 
     uint16_t lastPacketId = 0;          // счётчик ИСХОДЯЩИХ пакетов
     uint16_t lastReceivedCommandId = 0; // dedup ВХОДЯЩИХ пакетов от Хаба
+
+    // Отдельно от lastReceivedCommandId выше (тот ПРИНУДИТЕЛЬНО сбрасывается в 0 НА
+    // КАЖДОЕ announce Хаба — и потому не годится для отличия настоящей перезагрузки
+    // Хаба от обычной ретрансляции, см. handleIncoming() в .cpp) - отслеживает СОБСТВЕННЫЙ
+    // счётчик packet_id Хаба, каким его видел этот узел в ПРЕДЫДУЩЕМ announce.
+    uint16_t lastHubAnnouncePacketId = 0;
+    bool hubAnnounceSeen = false; // false до ПЕРВОГО виденного announce Хаба за время жизни этого объекта
 
     unsigned long lastTelemetryTime = 0;
     unsigned long lastConfigTime = 0;

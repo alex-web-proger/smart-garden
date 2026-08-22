@@ -26,6 +26,10 @@ void GardenNode::setCallbacks(FillPayloadFn fillConfig, FillPayloadFn fillTeleme
     onWatchdogFn = onWatchdog;
 }
 
+void GardenNode::setConfigHandler(OnSetConfigFn onSetConfig) {
+    onSetConfigFn = onSetConfig;
+}
+
 void GardenNode::setTiming(unsigned long tIntervalMs, unsigned long tJitterMs,
                             unsigned long cIntervalMs, unsigned long cJitterMs,
                             unsigned long wdTimeoutMs) {
@@ -105,17 +109,50 @@ void GardenNode::handleIncoming(const UniversalPacket &packet) {
     bool addressedToAll = memcmp(packet.receiver_mac, BROADCAST_MAC, 6) == 0;
     if (!addressedToMe && !addressedToAll) return;
 
-    // 2. Хаб перезагрузился и объявляет об этом broadcast-ом MSG_CONFIG.
-    //    Сбрасываем dedup ДО проверки isNewerPacketId ниже - иначе само
-    //    announce-сообщение могло бы быть отклонено как "старое"
-    //    (см. PROTOCOL.md §4.3).
-    if (packet.device_type == TYPE_HUB && packet.msg_type == MSG_CONFIG) {
-        lastReceivedCommandId = 0;
-        Serial.println("Hub объявил о (пере)загрузке - dedup сброшен");
+    // 2. Hub перезагрузился и объявляет об этом broadcast-ом MSG_CONFIG. В отличие от
+    //    старой версии, ЗДЕСЬ lastReceivedCommandId НЕ трогается (см. п.3 ниже: hub-announce
+    //    теперь ПОЛНОСТЬЮ обходит проверку свежести и синхронизирует счётчик НАПРЯМУЮ
+    //    с packet_id ЭТОГО пакета). Сброс в 0 был ошибкой: если СОБСТВЕННЫЙ исходящий
+    //    счётчик Хаба (lastPacketId в hub.ino) к этому моменту уже перевалил за половину
+    //    16-битного диапазона (32768 - вполне реально при достаточном аптайме,
+    //    ведь Хаб шлёт по announce на КАЖДОЕ периодическое CONFIG любого узла, см.
+    //    processIncomingPacket() в hub.ino), то САМО это announce отклонялось бы шагом ниже
+    //    как "старое" относительно свежеобнулённого 0 (см. isNewerPacketId()) - узел оставался бы
+    //    отклонённым, пока packet_id всех последующих пакетов Хаба не сделает полный
+    //    оборот (дни). См. PROTOCOL.md §4.5.
+    bool isHubAnnounce = (packet.device_type == TYPE_HUB && packet.msg_type == MSG_CONFIG);
 
-        // Тем же пакетом Хаб мог разнести своё текущее время (см.
-        // PROTOCOL.md §12). epoch==0 - валидное значение "Хаб сам ещё не
-        // синхронизирован", а не ошибка - в этом случае часы узла не
+    if (isHubAnnounce) {
+        Serial.println("Hub объявил о (пере)загрузке");
+
+        // Хаб мог либо ДЕЙСТВИТЕЛЬНО перезагрузиться, либо просто РЕТРАНСЛИРОВАТЬ это
+        // announce в ответ на ЧЬЕ-ЛИБО чужое периодическое MSG_CONFIG (Hub в hub.ino делает
+        // это для ЛЮБОГО пришедшего MSG_CONFIG, чтобы быстро синхронизировать время
+        // свежезагруженного УЗЛА, а не только ПРИ СВОЕЙ собственной перезагрузке -
+        // см. processIncomingPacket() в hub.ino). Отличаем эти два случая по packet_id
+        // САМОГО ХабА: при реальной перезагрузке Хаба его СОБСТВЕННЫЙ счётчик
+        // исходящих пакетов (lastPacketId в hub.ino) сбрасывается в 0 и растёт заново -
+        // то есть packet_id этого announce будет МЕНЬШЕ последнего виденного нами (в
+        // циклическом смысле, см. isNewerPacketId()) - а не просто следующим по порядку,
+        // как при обычной ретрансляции. Именно в этом случае (Хаб потерял нашу
+        // конфигурацию вместе с RAM) имеет смысл немедленно переслать её заново, не
+        // ждущи планового MSG_CONFIG (база ~1 час, см. PROTOCOL.md) - если бы узел
+        // реагировал на ЛЮБОЙ announce безусловно - при 30-50 узлах это была бы
+        // лавина: очередной узел присылает свой CONFIG -> Хаб шлёт очередной announce всем
+        // (таково его поведение, см. выше) -> все другие узлы тоже перешлют свой
+        // CONFIG -> новые announce'ы всем ... и так бесконечно - поэтому проверка
+        // ниже КРИТИЧНА, а не просто "для надёжности".
+        if (hubAnnounceSeen && !isNewerPacketId(packet.packet_id, lastHubAnnouncePacketId)) {
+            Serial.println("Похоже, Hub ПЕРЕЗАГРУЗИЛСЯ (packet_id сброшен) - пересылаю свою "
+                            "конфигурацию заново");
+            sendConfig();
+        }
+        hubAnnounceSeen = true;
+        lastHubAnnouncePacketId = packet.packet_id;
+
+        // Тем же пакетом Хаб мог разнести своё текущее МЕСТНОЕ время (таким его
+        // прислал браузер, см. PROTOCOL.md §12). epoch==0 - валидное значение "Хаб сам
+        // ещё не синхронизирован", а не ошибка - в этом случае часы узла не
         // трогаем, чтобы не затереть уже возможно валидное время, полученное
         // ранее (например, если Хаб перезагрузился и ещё не успел 
         // пересинхронизироваться с браузером заново).
@@ -130,8 +167,12 @@ void GardenNode::handleIncoming(const UniversalPacket &packet) {
         }
     }
 
-    // 3. Дедупликация с учётом переполнения uint16_t.
-    if (!isNewerPacketId(packet.packet_id, lastReceivedCommandId)) {
+    // 3. Дедупликация с учётом переполнения uint16_t. Hub-announce (isHubAnnounce) принимается
+    // БЕЗУСЛОВНО, МИНУЯ эту проверку - он и есть сам сигнал "начни отсчёт заново",
+    // сравнивать его со СТАРЫМ значением было бы бессмысленно (и опасно - см. п.2 выше).
+    // lastReceivedCommandId синхронизируется НАПРЯМУЮ с packet_id ЭТОГО пакета (а не с 0) -
+    // это и есть новая точка отсчёта.
+    if (!isHubAnnounce && !isNewerPacketId(packet.packet_id, lastReceivedCommandId)) {
         Serial.printf("Ignored duplicate/old packet_id=%u (last=%u)\n",
                        packet.packet_id, lastReceivedCommandId);
         return;
@@ -147,6 +188,22 @@ void GardenNode::handleIncoming(const UniversalPacket &packet) {
         if (onCommandFn) status = onCommandFn(packet);
         sendAck(packet.packet_id, status);
     }
+
+    // 5. Новая конфигурация от Хаба - то же самое авто-ACK, что и у
+    // команды выше, но дополнительно - если колбэк принял и применил новые
+    // значения (status==0), немедленно шлём очередной MSG_CONFIG - тот же
+    // механизм, что и у sendConfig() в setup() узла, просто триггернутый сейчас,
+    // а не при загрузке - чтобы Хаб увидел новые valve_count/mode быстро, а не ждал
+    // планового MSG_CONFIG (база ~1 час, см. PROTOCOL.md). При отказе (status!=0,
+    // например невалидное valve_count) ничего дополнительно не шлём - сам ACK{status=1}
+    // уже сообщил Хабу, что ничего не изменилось, повторное эхо с теми же старыми
+    // значениями ничего бы не добавило.
+    if (packet.msg_type == MSG_SET_CONFIG) {
+        uint8_t status = 0;
+        if (onSetConfigFn) status = onSetConfigFn(packet);
+        sendAck(packet.packet_id, status);
+        if (status == 0) sendConfig();
+    }
 }
 
 void GardenNode::armWatchdog() {
@@ -157,16 +214,18 @@ void GardenNode::disarmWatchdog() {
     watchdogArmed = false;
 }
 
-// UTC, симметрично Hub::currentTimeString() в hub.ino - тот же формат вывода,
-// чтобы логи Хаба и узла читались одинаково. Не привязываемся к местному
-// часовому поясу по той же причине: не тащить на встраиваемую систему
-// перевод часовых поясов/DST.
+// Симметрично Hub::currentTimeString() в hub.ino - тот же формат вывода, чтобы
+// логи Хаба и узла читались одинаково. Хранимое значение - МЕСТНОЕ
+// время (таким его уже прислал Хаб в announce, сам ПОЛУЧИВШИЙ его от браузера,
+// см. PROTOCOL.md §12) - поэтому тут оно просто читается `gmtime_r()`-ом как есть, без
+// какого-либо повторного сдвига здесь - часовой пояс уже учтён браузером до
+// отправки, а Хаб просто ретранслирует полученное значение дальше узлам как есть.
 String GardenNode::currentTimeString() const {
     time_t now = time(nullptr);
     struct tm timeinfo;
     gmtime_r(&now, &timeinfo);
-    char buf[25];
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d UTC",
+    char buf[20];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
               timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
               timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
     return String(buf);

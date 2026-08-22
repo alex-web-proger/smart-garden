@@ -9,6 +9,33 @@
 // Отдаётся как есть, никакого шаблонизатора на стороне Хаба - данные
 // устройств страница получает сама через /api/devices (fetch), см.
 // hub.ino и PROTOCOL.md §10/§11.
+//
+// ПРЕДСТАВЛЕНИЕ УСТРОЙСТВ: карточки в адаптивной сетке (а не таблица) -
+// каждая карточка залита цветом по статусу (установлено/кандидат),
+// показывает индикатор связи, тип и условное имя устройства. Подробности
+// (MAC, точный статус, управление клапанами, install/forget) вынесены в
+// модальное окно по кнопке ⚙ на карточке - на самой карточке места под
+// это нет, да и не нужно для беглого взгляда на состояние сети.
+//
+// КОНФИГУРАЦИЯ МОДУЛЯ: /api/devices отдаёт реальные valveCount/mode узла
+// (см. IrrigationDevice в hub/IrrigationDevice.h) - модальное окно рисует
+// РОВНО столько клапанов, сколько сейчас сконфигурировано на самом
+// узле (0, пока первый MSG_CONFIG от него ещё не пришёл - тогда секция
+// клапанов временно пуста). Тут же, ниже клапанов - сектор "Конфигурация
+// модуля" с количеством каналов (1-5) и режимом работы (1/2, семантика
+// будет определена позже) - изменения уходят на Хаб через POST
+// /api/setConfig, который отправляет узлу MSG_SET_CONFIG; узел сам валидирует,
+// применяет и СОХРАНЯЕТ конфигурацию у себя (EEPROM, переживает его
+// перезагрузку) - см. GardenProtocol.h/PROTOCOL.md §3.2 и onSetConfig() в
+// flow_node.ino.
+//
+// НАЗВАНИЕ УСТРОЙСТВА: карточка показывает его вместо "Узел #idx", если
+// оно задано - редактируется в модальном окне (поле "Название" + кнопка
+// 💾), доступно ТОЛЬКО для установленных устройств (ограничение
+// проверяется и на стороне Хаба, см. DeviceManager::setName()) и
+// сохраняется в NVS - переживает перезагрузку Хаба. Индекс (#idx) при
+// этом всё равно показывается рядом на карточке - для сверки с выводом
+// Serial-команды list, где своих названий нет.
 
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -18,156 +45,506 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Smart Garden — Хаб</title>
 <style>
+  * { box-sizing: border-box; }
   body { font-family: -apple-system, sans-serif; margin: 16px; background:#f6f6f2; color:#222; }
   h1 { font-size: 1.2em; margin-bottom: 4px; }
-  .sub { color:#777; font-size: 0.85em; margin-bottom: 16px; }
-  #time-status { font-size: 0.85em; margin-bottom: 12px; }
+  .sub { color:#777; font-size: 0.85em; margin-bottom: 14px; line-height:1.5; }
+  .legend-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin:0 3px -1px 0; }
+  #time-status { font-size: 0.85em; margin-bottom: 16px; }
   .time-synced { color:#2a7d2a; }
   .time-unsynced { color:#b8860b; }
-  table { width:100%; border-collapse: collapse; background:#fff; border-radius:8px; overflow:hidden; }
-  th, td { padding: 10px 8px; border-bottom: 1px solid #eee; text-align:left; font-size: 0.85em; vertical-align: middle; }
-  th { background:#eef4ea; }
-  button { padding: 8px 12px; margin: 2px; border:none; border-radius:6px; background:#4a7c3f; color:white; font-size:0.85em; }
+
+  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+  .empty { padding: 30px; text-align:center; color:#999; background:#fff; border-radius:10px; }
+
+  .device-card { position:relative; background:#fff; border-radius:10px; padding:14px 50px 14px 14px;
+                 border:2px solid transparent; box-shadow:0 1px 3px rgba(0,0,0,0.07); cursor:default; }
+  .device-card.status-installed { background:#e9f6e4; border-color:#bfe0b2; }
+  .device-card.status-candidate { background:#fff3e0; border-color:#f0c98a; }
+
+  .gear-btn { position:absolute; top:8px; right:8px; width:auto; height:auto; border-radius:0;
+              border:none; background:none; cursor:pointer; padding:0;
+              display:flex; align-items:center; justify-content:center;
+              box-shadow:none; }
+  .gear-btn svg { width:35px; height:35px; fill:#555; }
+  .gear-btn:active svg { fill:#222; }
+
+  .conn-row { display:flex; align-items:center; gap:6px; margin-bottom:8px; }
+  .conn-dot { width:9px; height:9px; border-radius:50%; flex:0 0 auto; }
+  .conn-dot.conn-ok { background:#2a7d2a; }
+  .conn-dot.conn-warn { background:#d8a400; }
+  .conn-dot.conn-bad { background:#c0392b; }
+  .device-type { font-size:0.72em; text-transform:uppercase; letter-spacing:0.04em; color:#666; }
+
+  .device-name { font-weight:600; font-size:1.05em; margin-bottom:2px; }
+  .device-sub { font-size:0.8em; color:#777; margin-bottom:10px; }
+
+  .status-pill { display:inline-block; font-size:0.75em; padding:3px 10px; border-radius:20px; font-weight:600; color:#fff; }
+  .status-pill.installed { background:#3a8f2e; }
+  .status-pill.candidate { background:#d8860a; }
+
+  /* --- Модальное окно --- */
+  .modal-backdrop { position:fixed; inset:0; background:rgba(0,0,0,0.45); display:none;
+                     align-items:center; justify-content:center; padding:16px; z-index:50; }
+  .modal-backdrop.open { display:flex; }
+  .modal { background:#fff; border-radius:12px; padding:20px; width:100%; max-width:420px;
+           max-height:90vh; overflow-y:auto; }
+  .modal-header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:4px; gap:10px; }
+  .modal-header h2 { margin:0; font-size:1.1em; }
+  .modal-close { border:none; background:none; font-size:22px; line-height:1; cursor:pointer; color:#888; padding:0 4px; }
+  .modal-sub { font-size:0.8em; color:#888; margin-bottom:14px; }
+
+  .modal-field { font-size:0.85em; margin-bottom:6px; color:#444; display:flex; justify-content:space-between; gap:10px; align-items:center; }
+  .modal-field b { color:#222; font-weight:600; }
+  .name-edit { display:flex; gap:6px; align-items:center; }
+  .name-edit input { width:130px; padding:4px 6px; border:1px solid #ccc; border-radius:4px; font-size:0.85em; }
+  .name-edit button { padding:4px 9px; font-size:0.9em; }
+
+  .modal-actions { margin:14px 0 4px; display:flex; gap:8px; flex-wrap:wrap; }
+
+  .valve-section { margin-top:14px; border-top:1px solid #eee; padding-top:12px; }
+  .valve-section h3 { font-size:0.9em; margin:0 0 8px; }
+  .duration-row { font-size:0.85em; margin-bottom:10px; display:flex; align-items:center; gap:8px; }
+  .duration-row input { width:60px; padding:4px; border:1px solid #ccc; border-radius:4px; }
+  .valve-row { display:flex; align-items:center; justify-content:space-between; gap:8px;
+               padding:7px 0; border-bottom:1px solid #f2f2f2; }
+  .valve-row:last-child { border-bottom:none; }
+  .valve-state { font-size:0.85em; flex:1; text-align:right; padding-right:8px; }
+  .valve-state.open { color:#2a7d2a; font-weight:600; }
+  .valve-state.closed { color:#999; }
+
+  .config-section { margin-top:14px; border-top:1px solid #eee; padding-top:12px; }
+  .config-section h3 { font-size:0.9em; margin:0 0 8px; }
+  .config-row { font-size:0.85em; margin-bottom:10px; display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .config-row input, .config-row select { padding:4px 6px; border:1px solid #ccc; border-radius:4px; font-size:0.85em; }
+  .config-row input[type=number] { width:55px; }
+  .config-hint { font-size:0.75em; color:#999; margin:-4px 0 10px; }
+  button.apply-btn { background:#2a6fa3; }
+
+  button { padding: 8px 12px; border:none; border-radius:6px; background:#4a7c3f; color:white; font-size:0.85em; cursor:pointer; }
   button.close-btn { background:#a33; }
   button.install-btn { background:#2a6fa3; }
   button.forget-btn { background:#888; }
-  input[type=number] { width: 48px; padding:4px; border:1px solid #ccc; border-radius:4px; }
-  .valve-open { color:#2a7d2a; font-weight:bold; }
-  .valve-closed { color:#999; }
-  .status-installed { color:#2a7d2a; font-weight:bold; }
-  .status-candidate { color:#b8860b; }
-  .empty { padding: 20px; text-align:center; color:#999; }
 </style>
 </head>
 <body>
 <h1>Smart Garden — Хаб</h1>
-<div class="sub">Автообновление каждые 2 сек. "Кандидат" — обнаружен по трафику, может быть вытеснен. "Установлено" — подтверждено, сохранено, защищено от вытеснения.</div>
+<div class="sub">
+  Автообновление каждые 2 сек. Нажмите ⚙ на карточке устройства для подробностей, управления и переименования.<br>
+  <span class="legend-dot" style="background:#3a8f2e"></span>Установлено —
+  <span class="legend-dot" style="background:#d8860a"></span>Кандидат, не установлено (нажмите ⚙, чтобы установить)
+</div>
 <div id="time-status" class="time-unsynced">Синхронизация времени...</div>
-<table>
-  <thead><tr><th>#</th><th>MAC</th><th>Тип</th><th>Связь</th><th>Статус</th><th>Клапан</th><th>Управление</th></tr></thead>
-  <tbody id="devices-body"><tr><td colspan="7" class="empty">Загрузка...</td></tr></tbody>
-</table>
+
+<div class="grid" id="devices-grid"><div class="empty">Загрузка...</div></div>
+
+<!-- Модальное окно с подробностями устройства - одно на страницу,
+     переиспользуется для любого устройства (см. openModal() в скрипте) -->
+<div class="modal-backdrop" id="modal-backdrop">
+  <div class="modal">
+    <div class="modal-header">
+      <h2 id="modal-title">Устройство</h2>
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+    <div class="modal-sub" id="modal-sub"></div>
+
+    <div class="modal-field"><span>MAC-адрес</span><b id="modal-mac">—</b></div>
+    <div class="modal-field"><span>Связь</span><b id="modal-conn">—</b></div>
+    <div class="modal-field"><span>Статус</span><span id="modal-status" class="status-pill">—</span></div>
+
+    <!-- Действие "Установить" - показывается ТОЛЬКО для кандидата
+         (installed=false), см. updateModal() в скрипте. До установки больше
+         ничего показывать нечего - переименование/управление имеют смысл только
+         после того, как оператор подтвердил устройство. -->
+    <div class="modal-actions" id="modal-install-action"></div>
+
+    <!-- Всё, что ниже, имеет смысл ТОЛЬКО для УЖЕ УСТАНОВЛЕННОГО устройства
+         (переименование, удаление, управление клапанами и т.п. - всё, что специфично
+         для модуля или требует уже подтверждённого устройства) - кандидат сначала
+         должен быть установлен. Целиком скрыто/показано через display в
+         updateModal() - один тоггл, а не отдельный на каждый блок, как было раньше. -->
+    <div id="modal-installed-section" style="display:none;">
+      <!-- Сам 'input' создан ОДИН РАЗ навсегда (не пересоздаётся каждый раз) - его
+           значение выставляется ТОЛЬКО при открытии модалки (openModal()), а не на
+           каждый фоновый refresh() - иначе набранное пользователем значение
+           стиралось бы каждые 2 сек (та же причина, что и у #modal-duration ниже). -->
+      <div class="modal-field">
+        <span>Название</span>
+        <span class="name-edit">
+          <input type="text" id="modal-name-input" maxlength="23" placeholder="без названия">
+          <button onclick="saveDeviceName()" title="Сохранить название">💾</button>
+        </span>
+      </div>
+
+      <div class="modal-actions" id="modal-forget-action"></div>
+
+      <div id="modal-type-specific"></div>
+    </div>
+  </div>
+</div>
 
 <script>
-// idx -> { tr: <DOM-строка>, installed: bool } - хранится между вызовами
-// refresh(), чтобы не пересоздавать DOM-узлы (в т.ч. поля ввода)
-// на каждый тик автообновления.
-let rowsByIdx = {};
+// idx -> { el: <DOM-карточка>, installed: bool|null } - хранится между
+// вызовами refresh(), чтобы не пересоздавать DOM-узлы карточек на
+// каждый тик автообновления (та же идея, что раньше была для строк
+// таблицы).
+let cardsByIdx = {};
+
+// idx -> последние полученные данные устройства - нужно, чтобы
+// открыть/обновить модальное окно без отдельного похода в сеть.
+let devicesByIdx = {};
+
+// idx открытого сейчас модального окна, или null - пока оно открыто,
+// его данные обновляются вместе с обычным refresh() (кроме поля ввода
+// длительности - его руками никто не трогает, см. updateModal()).
+let openModalIdx = null;
+
+// Для какого idx/valveCount построена секция клапанов+конфигурации - см.
+// комментарий у нужной пересборки ниже (updateModal()).
+let typeSpecificBuiltFor = null;
+
+function connInfo(agoSec) {
+  // Пороги ориентируются на типичный интервал телеметрии (см.
+  // PROTOCOL.md) - раз в ~10 сек с некоторым джиттером.
+  if (agoSec < 30) return { cls: 'conn-ok' };
+  if (agoSec < 120) return { cls: 'conn-warn' };
+  return { cls: 'conn-bad' };
+}
+
+function typeText(type) {
+  return type === 1 ? 'Полив' : ('Тип ' + type);
+}
+
+function createCard(d) {
+  const el = document.createElement('div');
+  el.className = 'device-card';
+  el.innerHTML =
+    '<button class="gear-btn" title="Подробнее">' +
+      '<svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.63c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>' +
+    '</button>' +
+    '<div class="conn-row"><span class="conn-dot"></span><span class="device-type"></span></div>' +
+    '<div class="device-name"></div>' +
+    '<div class="device-sub"></div>' +
+    '<div class="status-pill"></div>';
+  el.querySelector('.gear-btn').addEventListener('click', () => openModal(d.idx));
+  return el;
+}
+
+function updateCard(el, d) {
+  el.className = 'device-card ' + (d.installed ? 'status-installed' : 'status-candidate');
+
+  const conn = connInfo(d.agoSec);
+  el.querySelector('.conn-dot').className = 'conn-dot ' + conn.cls;
+  el.querySelector('.device-type').textContent = typeText(d.type);
+  // Название, если оператор его задал (см. saveDeviceName()) - иначе
+  // стандартный вид по индексу, как и раньше.
+  el.querySelector('.device-name').textContent = (d.name && d.name.length > 0) ? d.name : ('Узел #' + d.idx);
+  // Индекс показываем всегда, даже когда есть своё название - помогает
+  // сопоставить с выводом Serial-команды 'list' (там имён нет, только индексы).
+  el.querySelector('.device-sub').textContent = d.agoSec + ' с назад · #' + d.idx;
+
+  const pill = el.querySelector('.status-pill');
+  pill.textContent = d.installed ? 'Установлено' : 'Кандидат';
+  pill.className = 'status-pill ' + (d.installed ? 'installed' : 'candidate');
+}
 
 async function refresh() {
   try {
     const res = await fetch('/api/devices');
     const devices = await res.json();
-    const body = document.getElementById('devices-body');
+    const grid = document.getElementById('devices-grid');
 
     if (devices.length === 0) {
-      body.innerHTML = '<tr><td colspan="7" class="empty">Устройств пока не видно</td></tr>';
-      rowsByIdx = {};
+      grid.innerHTML = '<div class="empty">Устройств пока не видно</div>';
+      cardsByIdx = {};
+      devicesByIdx = {};
+      if (openModalIdx !== null) closeModal();
       return;
     }
 
     // Перед первым реальным наполнением убираем плейсхолдер
     // ("Загрузка..."/"Устройств пока не видно").
-    if (Object.keys(rowsByIdx).length === 0) {
-      body.innerHTML = '';
+    if (Object.keys(cardsByIdx).length === 0) {
+      grid.innerHTML = '';
     }
 
+    devicesByIdx = {};
     const seenIdx = new Set();
 
     devices.forEach(d => {
+      devicesByIdx[d.idx] = d;
       seenIdx.add(d.idx);
-      const isOpen = d.activeValve !== 0;
-      const valveText = isOpen ? ('открыт #' + d.activeValve) : 'закрыт';
-      const typeText = d.type === 1 ? 'полив' : ('тип ' + d.type);
-      const statusText = d.installed ? 'установлено' : 'кандидат';
-      const statusClass = d.installed ? 'status-installed' : 'status-candidate';
 
-      let row = rowsByIdx[d.idx];
-      if (!row) {
-        // Строка создаётся ОДИН раз на устройство. В частности, поля
-        // ввода (valve-N/sec-N) создаются здесь и больше никогда не
-        // трогаются - именно это чинит "стирание при вводе": раньше
-        // вся строка (вместе с input-ами) пересоздавалась заново на каждый
-        // тик автообновления.
-        const tr = document.createElement('tr');
-        tr.innerHTML =
-          '<td>' + d.idx + '</td>' +
-          '<td>' + d.mac + '</td>' +
-          '<td>' + typeText + '</td>' +
-          '<td class="conn"></td>' +
-          '<td class="status"></td>' +
-          '<td class="valve"></td>' +
-          '<td>' +
-            '<input type="number" min="1" max="4" value="1" id="valve-' + d.idx + '"> клапан ' +
-            '<input type="number" min="1" value="10" id="sec-' + d.idx + '"> сек ' +
-            '<button onclick="openValve(' + d.idx + ')">Открыть</button>' +
-            '<button class="close-btn" onclick="closeValve(' + d.idx + ')">Закрыть</button>' +
-            '<span class="install-slot"></span>' +
-            '<button class="forget-btn">Забыть</button>' +
-          '</td>';
-        body.appendChild(tr);
-        row = { tr: tr, installed: null };
-        rowsByIdx[d.idx] = row;
+      let card = cardsByIdx[d.idx];
+      if (!card) {
+        card = createCard(d);
+        grid.appendChild(card);
+        cardsByIdx[d.idx] = card;
       }
-
-      // Дальше - обновление ТОЛЬКО тех ячеек, что реально меняются
-      // (время связи, статус, состояние клапана). Поля ввода и кнопки
-      // не пересоздаются, поэтому не теряют введённое значение/фокус.
-      row.tr.querySelector('.conn').textContent = d.agoSec + 'с назад';
-
-      const statusCell = row.tr.querySelector('.status');
-      statusCell.textContent = statusText;
-      statusCell.className = 'status ' + statusClass;
-
-      const valveCell = row.tr.querySelector('.valve');
-      valveCell.textContent = valveText;
-      valveCell.className = 'valve ' + (isOpen ? 'valve-open' : 'valve-closed');
-
-      // Кнопку "Установить"/обработчик "Забыть" трогаем, только если
-      // статус installed реально изменился (редкое, инициируется
-      // пользователем) событие - не на каждый тик.
-      if (row.installed !== d.installed) {
-        row.installed = d.installed;
-        const installSlot = row.tr.querySelector('.install-slot');
-        installSlot.innerHTML = d.installed
-          ? ''
-          : '<button class="install-btn" onclick="installDevice(' + d.idx + ')">Установить</button>';
-        row.tr.querySelector('.forget-btn')
-          .setAttribute('onclick', 'forgetDevice(' + d.idx + ', ' + d.installed + ')');
-      }
+      updateCard(card, d);
     });
 
     // Устройство пропало из ответа (например, кто-то его забыл через
-    // другой клиент) - убираем его строку.
-    Object.keys(rowsByIdx).forEach(function (idxStr) {
+    // другой клиент) - убираем его карточку.
+    Object.keys(cardsByIdx).forEach(function (idxStr) {
       const idx = Number(idxStr);
       if (!seenIdx.has(idx)) {
-        rowsByIdx[idx].tr.remove();
-        delete rowsByIdx[idx];
+        cardsByIdx[idx].remove();
+        delete cardsByIdx[idx];
       }
     });
+
+    // Модальное окно открыто на устройстве, которое либо пропало, либо
+    // обновилось - в первом случае закрываем, во втором - освежаем
+    // содержимое (кроме поля ввода длительности, см. updateModal()).
+    if (openModalIdx !== null) {
+      if (devicesByIdx[openModalIdx]) {
+        updateModal(devicesByIdx[openModalIdx]);
+      } else {
+        closeModal();
+      }
+    }
   } catch (e) {
     console.error('Не удалось обновить список устройств', e);
   }
 }
 
-async function sendCmd(idx, valve, mode, duration, volume) {
+function openModal(idx) {
+  const d = devicesByIdx[idx];
+  if (!d) return;
+  openModalIdx = idx;
+  document.getElementById('modal-title').textContent = typeText(d.type) + ' — Узел #' + idx;
+  // Значение поля имени выставляется ТОЛЬКО здесь, при самом открытии - см.
+  // комментарий у #modal-name-input в HTML выше.
+  document.getElementById('modal-name-input').value = d.name || '';
+  updateModal(d);
+  document.getElementById('modal-backdrop').classList.add('open');
+}
+
+function closeModal() {
+  openModalIdx = null;
+  typeSpecificBuiltFor = null;
+  document.getElementById('modal-backdrop').classList.remove('open');
+}
+
+// Обновляет ВСЁ содержимое модального окна, КРОМЕ поля ввода
+// длительности (#modal-duration) - оно создаётся один раз внутри
+// секции клапанов ниже, только если самого элемента ещё нет в DOM
+// (то есть при первом построении этой секции для текущего открытия
+// окна), а не на каждый фоновый refresh() - иначе набранное
+// пользователем значение стиралось бы каждые 2 сек.
+function updateModal(d) {
+  document.getElementById('modal-sub').textContent = 'MAC ' + d.mac;
+  document.getElementById('modal-mac').textContent = d.mac;
+  document.getElementById('modal-conn').textContent = d.agoSec + ' с назад';
+
+  const statusEl = document.getElementById('modal-status');
+  statusEl.textContent = d.installed ? 'Установлено' : 'Кандидат (не установлено)';
+  statusEl.className = 'status-pill ' + (d.installed ? 'installed' : 'candidate');
+
+  // Переименование/управление/удаление - только для уже установленных (совпадает
+  // с ограничением на стороне Хаба для переименования, см. DeviceManager::setName()) - один
+  // тоггл для всего блока целиком (имя + действия + тип-специфичная часть), а не
+  // отдельный на каждое поле внутри. Значение #modal-name-input здесь НЕ трогается
+  // (оно ставится только в openModal()) - иначе набранное пользователем значение
+  // стиралось бы каждые 2 сек при фоновом refresh().
+  document.getElementById('modal-installed-section').style.display = d.installed ? '' : 'none';
+
+  if (d.installed) {
+    document.getElementById('modal-install-action').innerHTML = '';
+    document.getElementById('modal-forget-action').innerHTML =
+      '<button class="forget-btn" onclick="forgetDevice(' + d.idx + ', true)">Удалить устройство</button>';
+  } else {
+    document.getElementById('modal-install-action').innerHTML =
+      '<button class="install-btn" onclick="installDevice(' + d.idx + ')">Установить</button>';
+    document.getElementById('modal-forget-action').innerHTML = '';
+  }
+
+  // Специфичная для типа устройства часть (только для установленных, см. выше) - сейчас
+  // есть только для полива (TYPE_IRRIGATION=1). Для будущих типов (освещение и т.п.)
+  // сюда добавится свой блок по тому же принципу, что и
+  // handleIrrigationPayload()/TODO в hub.ino.
+  if (!d.installed) return; // тип-специфичная часть всё равно скрыта внутри modal-installed-section
+  const typeSpecific = document.getElementById('modal-type-specific');
+  if (d.type === 1) {
+    // ПОЛНАЯ пересборка HTML (включая <select id="modal-cfg-mode">) происходит
+    // ТОЛЬКО когда число клапанов РЕАЛЬНО изменилось (структурное изменение -
+    // другое число строк) или при открытии модалки на другом устройстве - А НЕ на
+    // каждый фоновый refresh() (каждые 2 сек, пока модалка открыта) - без этого
+    // ограничения открытый нативный <select> закрывался бы САМ СОБОЙ при каждой
+    // перестройке DOM (браузер так реагирует на пересоздание узла, даже если значение
+    // потом корректно восстанавливается) - из-за этого выпадающий список режима
+    // самопроизвольно закрывался прямо во время выбора. На каждый обычный тик
+    // вместо этого точечно обновляется только состояние клапанов/подсказка режима -
+    // см. updateIrrigationLiveState() ниже.
+    const needsRebuild = !typeSpecificBuiltFor ||
+                          typeSpecificBuiltFor.idx !== d.idx ||
+                          typeSpecificBuiltFor.valveCount !== d.valveCount;
+    if (needsRebuild) {
+      buildIrrigationTypeSpecific(d);
+      typeSpecificBuiltFor = { idx: d.idx, valveCount: d.valveCount };
+    }
+    updateIrrigationLiveState(d);
+  } else {
+    typeSpecific.innerHTML =
+      '<div class="valve-section"><span style="color:#999;font-size:0.85em;">' +
+      'Специфичная информация для этого типа устройства пока не поддержана.</span></div>';
+    typeSpecificBuiltFor = null;
+  }
+}
+
+// Полная пересборка СТРУКТУРЫ секции клапанов+конфигурации - вызывается ТОЛЬКО из
+// updateModal() при needsRebuild==true выше (смена устройства/valveCount), НЕ на каждый
+// фоновый refresh(). Каждому ряду клапана и подсказке режима даются id - чтобы
+// updateIrrigationLiveState() могла обновить их точечно, не трогая остальной DOM.
+function buildIrrigationTypeSpecific(d) {
+  const typeSpecific = document.getElementById('modal-type-specific');
+
+  let rows = '';
+  for (let v = 1; v <= d.valveCount; v++) {
+    // Начальное состояние при построении - дальше его обновляет
+    // updateIrrigationLiveState(), а не повторный вызов этой функции.
+    const isOpen = ((d.activeValvesMask >> (v - 1)) & 1) === 1;
+    rows +=
+      '<div class="valve-row" id="valve-row-' + v + '">' +
+        '<span>Клапан ' + v + '</span>' +
+        '<span class="valve-state ' + (isOpen ? 'open' : 'closed') + '">' + (isOpen ? 'открыт' : 'закрыт') + '</span>' +
+        '<button class="' + (isOpen ? 'close-btn' : '') + '">' +
+          (isOpen ? 'Закрыть' : 'Открыть') +
+        '</button>' +
+      '</div>';
+  }
+
+  const existingDuration = document.getElementById('modal-duration');
+  const durationValue = existingDuration ? existingDuration.value : 10;
+
+  const existingCfgValves = document.getElementById('modal-cfg-valves');
+  const cfgValvesValue = existingCfgValves ? existingCfgValves.value : (d.valveCount || 4);
+  const existingCfgMode = document.getElementById('modal-cfg-mode');
+  const cfgModeValue = existingCfgMode ? existingCfgMode.value : (d.mode || 1);
+
+  typeSpecific.innerHTML =
+    '<div class="valve-section">' +
+      '<h3>Клапаны</h3>' +
+      (d.valveCount > 0
+        ? ('<div class="duration-row">' +
+             '<label for="modal-duration">Длительность открытия, сек:</label>' +
+             '<input type="number" min="1" id="modal-duration" value="' + durationValue + '">' +
+           '</div>' +
+           '<div id="modal-mode-hint" style="font-size:0.75em;color:#999;margin:-6px 0 8px;"></div>' +
+           rows)
+        : '<span style="color:#999;font-size:0.85em;">Ожидание конфигурации от устройства...</span>') +
+    '</div>' +
+    '<div class="config-section">' +
+      '<h3>Конфигурация модуля</h3>' +
+      '<div class="config-row">' +
+        '<label for="modal-cfg-valves">Количество каналов</label>' +
+        '<input type="number" min="1" max="5" id="modal-cfg-valves" value="' + cfgValvesValue + '">' +
+      '</div>' +
+      '<div class="config-row">' +
+        '<label for="modal-cfg-mode">Режим работы</label>' +
+        '<select id="modal-cfg-mode">' +
+          '<option value="1"' + (cfgModeValue == 1 ? ' selected' : '') + '>Режим 1</option>' +
+          '<option value="2"' + (cfgModeValue == 2 ? ' selected' : '') + '>Режим 2</option>' +
+        '</select>' +
+      '</div>' +
+      '<div class="config-hint">Хранится на самом устройстве и переживает его перезагрузку.</div>' +
+      '<button class="apply-btn" onclick="saveModuleConfig(' + d.idx + ')">Применить</button>' +
+    '</div>';
+}
+
+// Точечное обновление состояния клапанов/подсказки режима - вызывается НА
+// КАЖДЫЙ refresh(), НО НЕ трогает форму конфигурации (#modal-cfg-valves/#modal-cfg-mode) и
+// #modal-duration вообще - именно это и решает проблему самопроизвольного закрытия
+// выпадающего списка режима (см. buildIrrigationTypeSpecific() выше). Если d.valveCount<=0
+// (ещё нет конфигурации от узла) - обновлять нечего, показывается заглушка "ожидание".
+function updateIrrigationLiveState(d) {
+  if (d.valveCount <= 0) return;
+  for (let v = 1; v <= d.valveCount; v++) {
+    const row = document.getElementById('valve-row-' + v);
+    if (!row) continue; // на всякий случай, если структура ещё не построена в этом тике
+    const isOpen = ((d.activeValvesMask >> (v - 1)) & 1) === 1;
+    const stateEl = row.querySelector('.valve-state');
+    const btnEl = row.querySelector('button');
+    stateEl.className = 'valve-state ' + (isOpen ? 'open' : 'closed');
+    stateEl.textContent = isOpen ? 'открыт' : 'закрыт';
+    btnEl.className = isOpen ? 'close-btn' : '';
+    btnEl.textContent = isOpen ? 'Закрыть' : 'Открыть';
+    btnEl.onclick = () => valveButtonClick(d.idx, v, isOpen);
+  }
+
+  const hint = document.getElementById('modal-mode-hint');
+  if (hint) {
+    hint.textContent = d.mode === 2
+      ? 'Режим 2: клапаны управляются независимо друг от друга.'
+      : 'Режим 1: открытие клапана закрывает остальные.';
+  }
+}
+
+// ACTION_OPEN=0, ACTION_CLOSE=1 (см. ValveAction в GardenProtocol.h) - дублирую
+// числами здесь вместо именованных констант - это JS, не C++, общего enum'а с
+// протоколом нет, значения дублируются вручную.
+function valveButtonClick(idx, valve, wasOpen) {
+  if (wasOpen) {
+    // Закрываем ТОЛЬКО этот конкретный клапан (не все сразу) - корректно
+    // работает в обоих режимах: в режиме 1 это и так был единственный открытый
+    // клапан, в режиме 2 - останутся открытыми, как и должно быть при независимом
+    // управлении.
+    sendCmd(idx, valve, 1, 0, 0, 0);
+  } else {
+    const durationInput = document.getElementById('modal-duration');
+    const sec = durationInput ? (durationInput.value || 10) : 10;
+    sendCmd(idx, valve, 0, 0, sec, 0);
+  }
+}
+
+async function sendCmd(idx, valve, action, mode, duration, volume) {
   await fetch('/api/command', {
     method: 'POST',
     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-    body: 'idx=' + idx + '&valve=' + valve + '&mode=' + mode + '&duration=' + duration + '&volume=' + volume
+    body: 'idx=' + idx + '&valve=' + valve + '&action=' + action + '&mode=' + mode + '&duration=' + duration + '&volume=' + volume
   });
   setTimeout(refresh, 300);
 }
 
-function openValve(idx) {
-  const valve = document.getElementById('valve-' + idx).value;
-  const sec = document.getElementById('sec-' + idx).value;
-  sendCmd(idx, valve, 0, sec, 0);
+// Сохраняет конфигурацию модуля (количество каналов/режим) из формы в
+// модалке - отправляет их НА УЗЛ (POST /api/setConfig -> MSG_SET_CONFIG, см.
+// sendSetConfig() в hub.ino) - узел сам валидирует и применяет, поэтому здесь
+// нет оптимистичного обновления интерфейса - очередной фоновый refresh() подтянет
+// уже действительное значение с узла (d.valveCount/d.mode), как только тот пришлёт (смотри
+// комментарий у config-section в updateModal()).
+async function saveModuleConfig(idx) {
+  const valves = document.getElementById('modal-cfg-valves').value;
+  const mode = document.getElementById('modal-cfg-mode').value;
+  await fetch('/api/setConfig', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body: 'idx=' + idx + '&valveCount=' + valves + '&mode=' + mode
+  });
+  setTimeout(refresh, 300);
 }
 
 function closeValve(idx) {
-  sendCmd(idx, 0, 0, 0, 0);
+  // Закрыть ВСЕ клапаны устройства разом (target_valve=0 + ACTION_CLOSE, см.
+  // sendCommand() в hub.ino) - сейчас ничем в интерфейсе не вызывается напрямую
+  // (кнопка у каждого клапана теперь закрывает ТОЛЬКО его, см. valveButtonClick()) -
+  // оставлена как готовая точка расширения (например, кнопка "Закрыть всё"
+  // для режима 2, если понадобится).
+  sendCmd(idx, 0, 1, 0, 0, 0);
+}
+
+// Сохраняет название текущего открытого в модалке устройства (openModalIdx) -
+// кнопка 💾 рядом с полем не передаёт idx явно - модалка всегда одна на страницу,
+// открыта ровно для одного устройства за раз.
+async function saveDeviceName() {
+  if (openModalIdx === null) return;
+  const input = document.getElementById('modal-name-input');
+  await fetch('/api/rename', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body: 'idx=' + openModalIdx + '&name=' + encodeURIComponent(input.value)
+  });
+  setTimeout(refresh, 300);
 }
 
 async function installDevice(idx) {
@@ -189,8 +566,18 @@ async function forgetDevice(idx, installed) {
     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
     body: 'idx=' + idx
   });
+  closeModal();
   setTimeout(refresh, 300);
 }
+
+// Закрытие модального окна по клику на затемнённый фон (не на саму
+// карточку модального окна) и по Escape - обычные ожидаемые способы.
+document.getElementById('modal-backdrop').addEventListener('click', (e) => {
+  if (e.target.id === 'modal-backdrop') closeModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && openModalIdx !== null) closeModal();
+});
 
 // Хаб не имеет RTC-модуля с батарейкой - его часы (time()/settimeofday())
 // сбрасываются на 1970-01-01 при каждой перезагрузке. Нужно МЕСТНОЕ
