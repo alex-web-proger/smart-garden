@@ -50,9 +50,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   h1 { font-size: 1.2em; margin-bottom: 4px; }
   .sub { color:#777; font-size: 0.85em; margin-bottom: 14px; line-height:1.5; }
   .legend-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin:0 3px -1px 0; }
-  #time-status { font-size: 0.85em; margin-bottom: 16px; }
+  #time-status { font-size: 0.85em; margin-bottom: 4px; }
   .time-synced { color:#2a7d2a; }
   .time-unsynced { color:#b8860b; }
+  #uptime-status { font-size: 0.85em; margin-bottom: 16px; color:#666; }
 
   .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
   .empty { padding: 30px; text-align:center; color:#999; background:#fff; border-radius:10px; }
@@ -121,6 +122,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .config-hint { font-size:0.75em; color:#999; margin:-4px 0 10px; }
   button.apply-btn { background:#2a6fa3; }
 
+  /* Кратковременная обратная связь на кнопках сохранения (имя, конфигурация модуля) -
+     см. flashButton() в скрипте: меняем цвет/текст кнопки на пару секунд после
+     ответа сервера, чтобы было явно видно, применились изменения или нет. */
+  button.btn-flash-ok { background:#2a7d2a !important; }
+  button.btn-flash-err { background:#c0392b !important; }
+
   button { padding: 8px 12px; border:none; border-radius:6px; background:#4a7c3f; color:white; font-size:0.85em; cursor:pointer; }
   button.close-btn { background:#a33; }
   button.install-btn { background:#2a6fa3; }
@@ -135,6 +142,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <span class="legend-dot" style="background:#d8860a"></span>Кандидат, не установлено (нажмите ⚙, чтобы установить)
 </div>
 <div id="time-status" class="time-unsynced">Синхронизация времени...</div>
+<div id="uptime-status" class="uptime-status">Время работы: —</div>
 
 <div class="grid" id="devices-grid"><div class="empty">Загрузка...</div></div>
 
@@ -172,7 +180,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <span>Название</span>
         <span class="name-edit">
           <input type="text" id="modal-name-input" maxlength="23" placeholder="без названия">
-          <button onclick="saveDeviceName()" title="Сохранить название">💾</button>
+          <button onclick="saveDeviceName(this)" title="Сохранить название">💾</button>
         </span>
       </div>
 
@@ -449,7 +457,7 @@ function buildIrrigationTypeSpecific(d) {
         '</select>' +
       '</div>' +
       '<div class="config-hint">Хранится на самом устройстве и переживает его перезагрузку.</div>' +
-      '<button class="apply-btn" onclick="saveModuleConfig(' + d.idx + ')">Применить</button>' +
+      '<button class="apply-btn" onclick="saveModuleConfig(this, ' + d.idx + ')">Применить</button>' +
     '</div>';
 }
 
@@ -513,14 +521,23 @@ async function sendCmd(idx, valve, action, mode, duration, volume) {
 // нет оптимистичного обновления интерфейса - очередной фоновый refresh() подтянет
 // уже действительное значение с узла (d.valveCount/d.mode), как только тот пришлёт (смотри
 // комментарий у config-section в updateModal()).
-async function saveModuleConfig(idx) {
+async function saveModuleConfig(btn, idx) {
   const valves = document.getElementById('modal-cfg-valves').value;
   const mode = document.getElementById('modal-cfg-mode').value;
-  await fetch('/api/setConfig', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-    body: 'idx=' + idx + '&valveCount=' + valves + '&mode=' + mode
-  });
+  try {
+    const res = await fetch('/api/setConfig', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'idx=' + idx + '&valveCount=' + valves + '&mode=' + mode
+    });
+    // Здесь "успешно" означает только "Хаб принял запрос и отправил его узлу" - самузел
+    // валидирует и применяет асинхронно (см. комментарий выше у config-section) - достоверное
+    // подтверждение применённого значения всё равно придёт позже с очередным refresh(), когда
+    // узел пришлёт свои реальные d.valveCount/d.mode.
+    flashButton(btn, res.ok ? '✓ Отправлено' : '✗ Ошибка', res.ok);
+  } catch (e) {
+    flashButton(btn, '✗ Ошибка', false);
+  }
   setTimeout(refresh, 300);
 }
 
@@ -533,17 +550,43 @@ function closeValve(idx) {
   sendCmd(idx, 0, 1, 0, 0, 0);
 }
 
+// Кратковременно показывает на кнопке btn, применились ли изменения - меняет её
+// текст/цвет (через btn-flash-ok/btn-flash-err, см. стили выше) на
+// FLASH_DURATION_MS, потом возвращает исходный вид. Оригинальный текст кнопки
+// запоминается в dataset при первом вызове (на случай, если кнопку нажмут
+// повторно до того, как предыдущий flash закончился - таймер перезапускается, старый
+// через clearTimeout не успеет вернуть чужой текст поверх нового).
+const FLASH_DURATION_MS = 1600;
+function flashButton(btn, tempText, ok) {
+  if (!btn.dataset.origText) btn.dataset.origText = btn.textContent;
+  if (btn._flashTimer) clearTimeout(btn._flashTimer);
+  btn.textContent = tempText;
+  btn.classList.remove('btn-flash-ok', 'btn-flash-err');
+  btn.classList.add(ok ? 'btn-flash-ok' : 'btn-flash-err');
+  btn._flashTimer = setTimeout(() => {
+    btn.textContent = btn.dataset.origText;
+    btn.classList.remove('btn-flash-ok', 'btn-flash-err');
+    btn._flashTimer = null;
+  }, FLASH_DURATION_MS);
+}
+
 // Сохраняет название текущего открытого в модалке устройства (openModalIdx) -
-// кнопка 💾 рядом с полем не передаёт idx явно - модалка всегда одна на страницу,
-// открыта ровно для одного устройства за раз.
-async function saveDeviceName() {
+// кнопка 💾 теперь передаёт себя (this) в аргументе - чтобы показать на ней
+// кратковременную обратную связь после ответа сервера (см. flashButton()) - раньше
+// оператор не видел никакого подтверждения, что нажатие вообще что-то сделало.
+async function saveDeviceName(btn) {
   if (openModalIdx === null) return;
   const input = document.getElementById('modal-name-input');
-  await fetch('/api/rename', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-    body: 'idx=' + openModalIdx + '&name=' + encodeURIComponent(input.value)
-  });
+  try {
+    const res = await fetch('/api/rename', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'idx=' + openModalIdx + '&name=' + encodeURIComponent(input.value)
+    });
+    flashButton(btn, res.ok ? '✓' : '✗', res.ok);
+  } catch (e) {
+    flashButton(btn, '✗', false);
+  }
   setTimeout(refresh, 300);
 }
 
@@ -621,6 +664,20 @@ async function syncTime() {
   refreshStatus();
 }
 
+// Форматирует время работы в секундах (uptimeSec из /api/status, считается на самом Хабе
+// от millis(), см. handleApiStatus() в hub.ino) в читаемый вид "N д. HH:MM:SS" (дни опускаются,
+// если их 0) - это время СОБСТВЕННО ХАБА с момента его последнего сброса/включения питания
+// (в отличие от часов выше - не зависит от синхронизации с браузером/DS3231, доступно всегда).
+function formatUptime(totalSec) {
+  const days = Math.floor(totalSec / 86400);
+  const hours = Math.floor((totalSec % 86400) / 3600);
+  const mins = Math.floor((totalSec % 3600) / 60);
+  const secs = totalSec % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  const hms = pad(hours) + ':' + pad(mins) + ':' + pad(secs);
+  return days > 0 ? (days + ' д. ' + hms) : hms;
+}
+
 async function refreshStatus() {
   try {
     const res = await fetch('/api/status');
@@ -632,6 +689,10 @@ async function refreshStatus() {
     } else {
       el.textContent = 'Время Хаба не синхронизировано (ожидание браузера)';
       el.className = 'time-unsynced';
+    }
+    const uptimeEl = document.getElementById('uptime-status');
+    if (typeof status.uptimeSec === 'number') {
+      uptimeEl.textContent = 'Время работы с момента сброса: ' + formatUptime(status.uptimeSec);
     }
   } catch (e) {
     console.error('Не удалось получить статус Хаба', e);
