@@ -9,7 +9,23 @@
 #define MAX_VALVES 4        // сколько клапанов ФИЗИЧЕСКИ распаяно на этой плате (см. valvePins ниже) -
                              // верхняя граница для configuredValveCount, А НЕ текущее рабочее значение -
                              // то теперь конфигурируется с Хаба и хранится в EEPROM, см. ниже.
-#define HAS_FLOW_SENSOR 1
+
+// Датчик потока (сам датчик ещё не опрошит, см. TODO у fillTelemetry() ниже) - ОБА параметра
+// ТЕПЕРЬ КОНФИГУРИРУЕМЫЕ с Хаба (см. configuredHasFlowSensor/configuredFlowPulsesPerLiter ниже), а НЕ
+// компиляционные константы - одна и та же прошивка может стоять на плате и с датчиком, и без него.
+// Значения ниже - ТОЛЬКО стартовые дефолты до первого MSG_SET_CONFIG от Хаба (или если в EEPROM ещё
+// ничего не сохранено - самая первая прошивка платы, см. loadConfig() ниже): датчик по умолчанию считается
+// НЕ установленным (безопаснее, чем ошибочно считать его присутствующим и принимать мусорные показания
+// за реальный расход), а разрешение - типичное для распространённых герконовых датчиков вроде YF-S201 -
+// в любом случае только стартовое значение, реальное должно быть выставлено оператором через Хаб под
+// конкретный установленный датчик.
+#define DEFAULT_HAS_FLOW_SENSOR 0
+#define DEFAULT_FLOW_PULSES_PER_LITER 450
+
+// Границы валидации flow_pulses_per_liter при приёме MSG_SET_CONFIG (см. onSetConfig() ниже) -
+// с большим запасом над любым реальным датчиком - просто отсекают заведомо мусорный ввод (например, 0).
+#define MIN_FLOW_PULSES_PER_LITER 1
+#define MAX_FLOW_PULSES_PER_LITER 20000
 
 // Пины, на которые подключены светодиоды (через резистор) - на месте
 // реального МОСФЕТ-ключа, управляющего клапаном. Подробности выбора
@@ -39,16 +55,25 @@ uint8_t activeValvesMask = 0; // БИТОВАЯ МАСКА: бит (i) = кла�
 // прошивка платы) действуют значения по умолчанию ниже - MAX_VALVES каналов, режим 1.
 uint8_t configuredValveCount = MAX_VALVES;
 uint8_t configuredMode = 1;
+uint8_t configuredHasFlowSensor = DEFAULT_HAS_FLOW_SENSOR;
+uint16_t configuredFlowPulsesPerLiter = DEFAULT_FLOW_PULSES_PER_LITER;
 
 // Метка "конфигурация в EEPROM записана осмысленно" - отличает "узел уже
 // настраивали" от "EEPROM только что стёрт/чип новый" (обычно там 0xFF или мусор) -
 // без неё узел после первой же прошивки принял бы случайный мусор из непрограммированной
 // флеш-памяти за валидную конфигурацию.
-#define EEPROM_MAGIC 0x53
+// v2 (был 0x53): добавлены hasFlowSensor/pulsesPerLiter - магия поднята специально (а не
+// оставлена прежней), чтобы старый EEPROM с уже работавших в поле плат не был ошибочно принят
+// за уже содержащий новые поля (байты за прежним размером структуры никто туда не писал - при
+// чтении большей структуры там был бы мусор). Смена magic заставляет loadConfig() отклонить
+// старую запись как "нет валидной конфигурации" и один раз откатиться к дефолтам выше.
+#define EEPROM_MAGIC 0x54
 struct PersistedConfig {
     uint8_t magic;
     uint8_t valveCount;
     uint8_t mode;
+    uint8_t hasFlowSensor;
+    uint16_t pulsesPerLiter;
 };
 
 void saveConfig() {
@@ -56,24 +81,29 @@ void saveConfig() {
     cfg.magic = EEPROM_MAGIC;
     cfg.valveCount = configuredValveCount;
     cfg.mode = configuredMode;
+    cfg.hasFlowSensor = configuredHasFlowSensor;
+    cfg.pulsesPerLiter = configuredFlowPulsesPerLiter;
     EEPROM.put(0, cfg);
     EEPROM.commit();
 }
 
 // Вызывается ОДИН РАЗ в setup(), до esp_now_init()/node.begin() - читает то, что
 // Хаб мог задать ещё ДО этой перезагрузки (см. onSetConfig() ниже), в оперативные
-// configuredValveCount/configuredMode выше - до того, как они кому-либо понадобятся
-// (fillConfig()/applyValveState() и т.п.).
+// configuredValveCount/configuredMode/configuredHasFlowSensor/configuredFlowPulsesPerLiter выше - до того, как
+// они кому-либо понадобятся (fillConfig()/applyValveState() и т.п.).
 void loadConfig() {
     EEPROM.begin(sizeof(PersistedConfig));
     PersistedConfig cfg;
     EEPROM.get(0, cfg);
     if (cfg.magic == EEPROM_MAGIC && cfg.valveCount >= 1 && cfg.valveCount <= MAX_VALVES &&
-        (cfg.mode == 1 || cfg.mode == 2)) {
+        (cfg.mode == 1 || cfg.mode == 2) && (cfg.hasFlowSensor == 0 || cfg.hasFlowSensor == 1) &&
+        cfg.pulsesPerLiter >= MIN_FLOW_PULSES_PER_LITER && cfg.pulsesPerLiter <= MAX_FLOW_PULSES_PER_LITER) {
         configuredValveCount = cfg.valveCount;
         configuredMode = cfg.mode;
-        Serial.printf("Конфигурация восстановлена из EEPROM: valve_count=%u mode=%u\n",
-                      configuredValveCount, configuredMode);
+        configuredHasFlowSensor = cfg.hasFlowSensor;
+        configuredFlowPulsesPerLiter = cfg.pulsesPerLiter;
+        Serial.printf("Конфигурация восстановлена из EEPROM: valve_count=%u mode=%u has_flow_sensor=%u pulses_per_liter=%u\n",
+                      configuredValveCount, configuredMode, configuredHasFlowSensor, configuredFlowPulsesPerLiter);
     } else {
         Serial.println("В EEPROM нет валидной конфигурации - используются значения по умолчанию.");
         saveConfig(); // сразу же записываем дефолт - чтобы magic был выставлен для следующей загрузки
@@ -107,8 +137,9 @@ void fillConfig(UniversalPacket &pkt) {
     // MSG_SET_CONFIG от Хаба, см. onSetConfig() ниже) - НЕ компиляционные
     // константы, см. комментарий у IrrigationSpec в GardenProtocol.h.
     pkt.payload.irrigation.spec.valve_count = configuredValveCount;
-    pkt.payload.irrigation.spec.has_flow_sensor = HAS_FLOW_SENSOR;
+    pkt.payload.irrigation.spec.has_flow_sensor = configuredHasFlowSensor;
     pkt.payload.irrigation.spec.mode = configuredMode;
+    pkt.payload.irrigation.spec.flow_pulses_per_liter = configuredFlowPulsesPerLiter;
 }
 
 void fillTelemetry(UniversalPacket &pkt) {
@@ -205,9 +236,24 @@ uint8_t onSetConfig(const UniversalPacket &pkt) {
         Serial.printf("SET_CONFIG отклонён: mode=%u не поддержан (допустимо 1 или 2)\n", cfg.mode);
         return 1;
     }
+    // has_flow_sensor - чисто операторский выбор (см. комментарий у
+    // IrrigationConfigSet.has_flow_sensor в GardenProtocol.h) - узел не валидирует его против
+    // какого-либо аппаратного факта, только проверяет, что это валидный bool (0/1),
+    // а не мусор.
+    if (cfg.has_flow_sensor != 0 && cfg.has_flow_sensor != 1) {
+        Serial.printf("SET_CONFIG отклонён: has_flow_sensor=%u вне диапазона 0..1\n", cfg.has_flow_sensor);
+        return 1;
+    }
+    if (cfg.flow_pulses_per_liter < MIN_FLOW_PULSES_PER_LITER || cfg.flow_pulses_per_liter > MAX_FLOW_PULSES_PER_LITER) {
+        Serial.printf("SET_CONFIG отклонён: flow_pulses_per_liter=%u вне диапазона %u..%u\n",
+                      cfg.flow_pulses_per_liter, MIN_FLOW_PULSES_PER_LITER, MAX_FLOW_PULSES_PER_LITER);
+        return 1;
+    }
 
     configuredValveCount = cfg.valve_count;
     configuredMode = cfg.mode;
+    configuredHasFlowSensor = cfg.has_flow_sensor;
+    configuredFlowPulsesPerLiter = cfg.flow_pulses_per_liter;
     saveConfig();
 
     // Если valve_count уменьшился и какие-то биты оказались за пределами
@@ -230,8 +276,8 @@ uint8_t onSetConfig(const UniversalPacket &pkt) {
         node.sendTelemetryNow();
     }
 
-    Serial.printf("SET_CONFIG применён и сохранён: valve_count=%u mode=%u\n",
-                  configuredValveCount, configuredMode);
+    Serial.printf("SET_CONFIG применён и сохранён: valve_count=%u mode=%u has_flow_sensor=%u pulses_per_liter=%u\n",
+                  configuredValveCount, configuredMode, configuredHasFlowSensor, configuredFlowPulsesPerLiter);
     return 0;
 }
 

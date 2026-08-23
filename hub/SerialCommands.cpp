@@ -9,7 +9,7 @@ extern bool timeSynced;
 extern String currentTimeString();
 extern void sendCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uint8_t mode,
                          uint16_t durationSec, uint16_t volumeL);
-extern void sendSetConfig(int deviceIdx, uint8_t valveCount, uint8_t mode);
+extern void sendSetConfig(int deviceIdx, uint8_t valveCount, uint8_t mode, uint8_t hasFlowSensor, uint16_t pulsesPerLiter);
 
 //   list                          - показать известные устройства
 //   open <idx> <valve> <sec>      - открыть клапан на N секунд (mode=0). В режиме 1 (эксклюзивный)
@@ -18,10 +18,12 @@ extern void sendSetConfig(int deviceIdx, uint8_t valveCount, uint8_t mode);
 //   volume <idx> <valve> <liters> - открыть клапан на N литров (mode=1), та же оговорка про режимы
 //   close <idx> [valve]           - закрыть один конкретный клапан (если указан) или все сразу
 //                                    (без valve) - работает одинаково в обоих режимах
-//   config <idx> <valves> <mode>  - задать устройству количество каналов (1..5) и режим
-//                                    работы (1 - эксклюзивный, 2 - независимый) - хранится
-//                                    НА САМОМ узле (EEPROM), переживает его перезагрузку,
-//                                    в отличие от open/volume/close
+//   config <idx> <valves> <mode> <hasFlowSensor> <pulsesPerLiter>
+//                                 - задать устройству количество каналов (1..5), режим
+//                                    работы (1 - эксклюзивный, 2 - независимый), наличие
+//                                    датчика потока (0|1) и его разрешение (импульсов на
+//                                    литр, 1..20000) - хранится НА САМОМ узле (EEPROM),
+//                                    переживает его перезагрузку, в отличие от open/volume/close
 //   install <idx>                 - подтвердить устройство, защитить от вытеснения, сохранить в NVS
 //   forget <idx>                  - удалить устройство (установленное или нет) из таблицы и NVS
 //   rename <idx> <name>           - переименовать установленное устройство, сохранить в NVS
@@ -62,11 +64,11 @@ void handleSerialCommand(String line) {
             Serial.println("Использование: close <idx> [valve]");
         }
     } else if (cmd == "config") {
-        int idx, valves, mode;
-        if (sscanf(line.c_str(), "config %d %d %d", &idx, &valves, &mode) == 3) {
-            sendSetConfig(idx, (uint8_t) valves, (uint8_t) mode);
+        int idx, valves, mode, hasFlowSensor, pulsesPerLiter;
+        if (sscanf(line.c_str(), "config %d %d %d %d %d", &idx, &valves, &mode, &hasFlowSensor, &pulsesPerLiter) == 5) {
+            sendSetConfig(idx, (uint8_t) valves, (uint8_t) mode, (uint8_t) hasFlowSensor, (uint16_t) pulsesPerLiter);
         } else {
-            Serial.println("Использование: config <idx> <valves 1..5> <mode 1|2>");
+            Serial.println("Использование: config <idx> <valves 1..5> <mode 1|2> <hasFlowSensor 0|1> <pulsesPerLiter 1..20000>");
         }
     } else if (cmd == "install") {
         int idx;
@@ -122,6 +124,7 @@ void handleSerialCommand(String line) {
         }
     } else {
         Serial.println("Команды: list | open <idx> <valve> <sec> | volume <idx> <valve> <liters> | "
-                        "close <idx> [valve] | config <idx> <valves> <mode> | install <idx> | forget <idx> | rename <idx> <name> | time");
+                        "close <idx> [valve] | config <idx> <valves> <mode> <hasFlowSensor> <pulsesPerLiter> | "
+                        "install <idx> | forget <idx> | rename <idx> <name> | time");
     }
 }

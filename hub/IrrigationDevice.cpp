@@ -6,8 +6,9 @@ void IrrigationDevice::handlePayload(int idx, const UniversalPacket &pkt) {
         valveCount = spec.valve_count;
         hasFlowSensor = spec.has_flow_sensor;
         mode = spec.mode;
-        Serial.printf("CONFIG (IRRIGATION) от #%d: valve_count=%u has_flow_sensor=%u mode=%u\n",
-                      idx, spec.valve_count, spec.has_flow_sensor, spec.mode);
+        flowPulsesPerLiter = spec.flow_pulses_per_liter;
+        Serial.printf("CONFIG (IRRIGATION) от #%d: valve_count=%u has_flow_sensor=%u mode=%u pulses_per_liter=%u\n",
+                      idx, spec.valve_count, spec.has_flow_sensor, spec.mode, spec.flow_pulses_per_liter);
     } else if (pkt.msg_type == MSG_TELEMETRY) {
         IrrigationTelemetry t = pkt.payload.irrigation.telemetry;
         lastActiveValvesMask = t.active_valves; // кэш для веб-интерфейса
@@ -26,4 +27,5 @@ void IrrigationDevice::appendJsonFields(String &json) const {
     json += ",\"valveCount\":" + String(valveCount);
     json += ",\"mode\":" + String(mode);
     json += ",\"hasFlowSensor\":" + String(hasFlowSensor);
+    json += ",\"flowPulsesPerLiter\":" + String(flowPulsesPerLiter);
 }

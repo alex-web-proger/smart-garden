@@ -17,15 +17,15 @@
 // модальное окно по кнопке ⚙ на карточке - на самой карточке места под
 // это нет, да и не нужно для беглого взгляда на состояние сети.
 //
-// КОНФИГУРАЦИЯ МОДУЛЯ: /api/devices отдаёт реальные valveCount/mode узла
-// (см. IrrigationDevice в hub/IrrigationDevice.h) - модальное окно рисует
+// КОНФИГУРАЦИЯ МОДУЛЯ: /api/devices отдаёт реальные valveCount/mode/hasFlowSensor/
+// flowPulsesPerLiter узла (см. IrrigationDevice в hub/IrrigationDevice.h) - модальное окно рисует
 // РОВНО столько клапанов, сколько сейчас сконфигурировано на самом
 // узле (0, пока первый MSG_CONFIG от него ещё не пришёл - тогда секция
 // клапанов временно пуста). Тут же, ниже клапанов - сектор "Конфигурация
-// модуля" с количеством каналов (1-5) и режимом работы (1/2, семантика
-// будет определена позже) - изменения уходят на Хаб через POST
-// /api/setConfig, который отправляет узлу MSG_SET_CONFIG; узел сам валидирует,
-// применяет и СОХРАНЯЕТ конфигурацию у себя (EEPROM, переживает его
+// модуля" с количеством каналов (1-5), режимом работы (1/2), наличием датчика
+// потока (чекбокс) и его разрешением (импульсов на литр) - изменения уходят на
+// Хаб через POST /api/setConfig, который отправляет узлу MSG_SET_CONFIG; узел сам
+// валидирует, применяет и СОХРАНЯЕТ конфигурацию у себя (EEPROM, переживает его
 // перезагрузку) - см. GardenProtocol.h/PROTOCOL.md §3.2 и onSetConfig() в
 // flow_node.ino.
 //
@@ -430,6 +430,10 @@ function buildIrrigationTypeSpecific(d) {
   const cfgValvesValue = existingCfgValves ? existingCfgValves.value : (d.valveCount || 4);
   const existingCfgMode = document.getElementById('modal-cfg-mode');
   const cfgModeValue = existingCfgMode ? existingCfgMode.value : (d.mode || 1);
+  const existingCfgFlowSensor = document.getElementById('modal-cfg-flow-sensor');
+  const cfgFlowSensorChecked = existingCfgFlowSensor ? existingCfgFlowSensor.checked : !!d.hasFlowSensor;
+  const existingCfgPulses = document.getElementById('modal-cfg-pulses');
+  const cfgPulsesValue = existingCfgPulses ? existingCfgPulses.value : (d.flowPulsesPerLiter || 450);
 
   typeSpecific.innerHTML =
     '<div class="valve-section">' +
@@ -456,6 +460,15 @@ function buildIrrigationTypeSpecific(d) {
           '<option value="2"' + (cfgModeValue == 2 ? ' selected' : '') + '>Режим 2</option>' +
         '</select>' +
       '</div>' +
+      '<div class="config-row">' +
+        '<label for="modal-cfg-flow-sensor">Датчик расхода воды</label>' +
+        '<input type="checkbox" id="modal-cfg-flow-sensor"' + (cfgFlowSensorChecked ? ' checked' : '') + '>' +
+      '</div>' +
+      '<div class="config-row">' +
+        '<label for="modal-cfg-pulses">Импульсов на литр</label>' +
+        '<input type="number" min="1" max="20000" id="modal-cfg-pulses" value="' + cfgPulsesValue + '">' +
+      '</div>' +
+      '<div class="config-hint">Наличие датчика и его разрешение нужно указать вручную по модели вашего датчика (например, YF-S201 — 450 имп/л) — узел не умеет определить это сам.</div>' +
       '<div class="config-hint">Хранится на самом устройстве и переживает его перезагрузку.</div>' +
       '<button class="apply-btn" onclick="saveModuleConfig(this, ' + d.idx + ')">Применить</button>' +
     '</div>';
@@ -524,11 +537,14 @@ async function sendCmd(idx, valve, action, mode, duration, volume) {
 async function saveModuleConfig(btn, idx) {
   const valves = document.getElementById('modal-cfg-valves').value;
   const mode = document.getElementById('modal-cfg-mode').value;
+  const hasFlowSensor = document.getElementById('modal-cfg-flow-sensor').checked ? 1 : 0;
+  const pulsesPerLiter = document.getElementById('modal-cfg-pulses').value;
   try {
     const res = await fetch('/api/setConfig', {
       method: 'POST',
       headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: 'idx=' + idx + '&valveCount=' + valves + '&mode=' + mode
+      body: 'idx=' + idx + '&valveCount=' + valves + '&mode=' + mode +
+            '&hasFlowSensor=' + hasFlowSensor + '&pulsesPerLiter=' + pulsesPerLiter
     });
     // Здесь "успешно" означает только "Хаб принял запрос и отправил его узлу" - самузел
     // валидирует и применяет асинхронно (см. комментарий выше у config-section) - достоверное

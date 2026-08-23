@@ -26,7 +26,9 @@ public:
     // не получено (валидный диапазон valve_count - 1..5, mode - 1..2).
     uint8_t valveCount = 0;
     uint8_t mode = 0;
-    uint8_t hasFlowSensor = 0; // аппаратный факт узла, Хаб его не редактирует (см. IrrigationSpec)
+    uint8_t hasFlowSensor = 0;   // теперь конфигурируется с Хаба (см. GardenProtocol.h::IrrigationConfigSet), а не
+                                 // аппаратный факт узла - отображает, что в последнем подтверждённом узлом MSG_CONFIG.
+    uint16_t flowPulsesPerLiter = 0; // то же самое для разрешения датчика - 0 ещё ни разу не получено.
 
     IrrigationDevice(const uint8_t *macAddr) : Device(macAddr, TYPE_IRRIGATION) {}
 

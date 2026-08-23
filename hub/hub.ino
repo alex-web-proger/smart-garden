@@ -264,20 +264,20 @@ void sendCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uint8_t mod
                   targetValve, action, mode, durationSec, volumeL, txPacket.packet_id);
 }
 
-// Отправить MSG_SET_CONFIG конкретному устройству - желаемые valve_count/mode,
-// которые узел должен ПРИМЕНИТЬ И СОХРАНИТЬ у себя (EEPROM), в отличие от
+// Отправить MSG_SET_CONFIG конкретному устройству - желаемые valve_count/mode/has_flow_sensor/
+// flow_pulses_per_liter, которые узел должен ПРИМЕНИТЬ И СОХРАНИТЬ у себя (EEPROM), в отличие от
 // sendCommand() выше (разовое действие, не переживает перезагрузку узла).
 // Симметрично sendCommand() - тот же принцип адресации/сборки заголовка,
 // другой msg_type и payload. См. GardenProtocol.h (MSG_SET_CONFIG/
 // IrrigationConfigSet) и onSetConfig() на стороне узла (flow_node.ino).
 //
-// Диапазон 1..5 здесь - только базовая защита от заведомо бессмысленного
-// ввода (веб-форма и так ограничивает его тем же диапазоном, см. WebPage.h) -
-// РЕАЛЬНУЮ валидацию под конкретную плату (её фактическую распайку
-// MAX_VALVES) делает сам узел и может отклонить значение через
-// MSG_ACK{status=1}, даже если оно прошло эту проверку здесь - Хаб не знает
-// физическую ёмкость конкретного узла.
-void sendSetConfig(int deviceIdx, uint8_t valveCount, uint8_t mode) {
+// Диапазоны здесь (valveCount 1..5, hasFlowSensor 0/1, pulsesPerLiter 1..20000) - только
+// базовая защита от заведомо бессмысленного ввода (веб-форма и так ограничивает его
+// теми же диапазонами, см. WebPage.h) - РЕАЛЬНУЮ валидацию под конкретную плату (её
+// фактическую распайку MAX_VALVES, и какой датчик на ней реально стоит) делает сам узел
+// и может отклонить значение через MSG_ACK{status=1}, даже если оно прошло эту проверку
+// здесь - Хаб не знает физическую емкость/комплектацию конкретного узла.
+void sendSetConfig(int deviceIdx, uint8_t valveCount, uint8_t mode, uint8_t hasFlowSensor, uint16_t pulsesPerLiter) {
     if (!radioReady) {
         Serial.println("ESP-NOW не инициализирован - конфигурация не отправлена.");
         return;
@@ -286,13 +286,18 @@ void sendSetConfig(int deviceIdx, uint8_t valveCount, uint8_t mode) {
         Serial.println("Нет такого устройства (см. 'list')");
         return;
     }
-    if (valveCount < 1 || valveCount > 5 || (mode != 1 && mode != 2)) {
-        Serial.println("Некорректная конфигурация: valve_count должен быть 1..5, mode - 1 или 2.");
+    if (valveCount < 1 || valveCount > 5 || (mode != 1 && mode != 2) ||
+        (hasFlowSensor != 0 && hasFlowSensor != 1) ||
+        pulsesPerLiter < 1 || pulsesPerLiter > 20000) {
+        Serial.println("Некорректная конфигурация: valve_count должен быть 1..5, mode - 1 или 2, "
+                        "has_flow_sensor - 0 или 1, pulses_per_liter - 1..20000.");
         return;
     }
     prepareHeader(MSG_SET_CONFIG, deviceManager.devices[deviceIdx]->mac);
     txPacket.payload.irrigation.configSet.valve_count = valveCount;
     txPacket.payload.irrigation.configSet.mode = mode;
+    txPacket.payload.irrigation.configSet.has_flow_sensor = hasFlowSensor;
+    txPacket.payload.irrigation.configSet.flow_pulses_per_liter = pulsesPerLiter;
 
     esp_err_t result = esp_now_send(BROADCAST_MAC, (uint8_t *) &txPacket, sizeof(txPacket));
     if (result != ESP_OK) {
@@ -300,7 +305,8 @@ void sendSetConfig(int deviceIdx, uint8_t valveCount, uint8_t mode) {
     }
 
     Serial.print("Sent SET_CONFIG to #"); Serial.print(deviceIdx);
-    Serial.printf(" valve_count=%u mode=%u (packet_id=%u)\n", valveCount, mode, txPacket.packet_id);
+    Serial.printf(" valve_count=%u mode=%u has_flow_sensor=%u pulses_per_liter=%u (packet_id=%u)\n",
+                  valveCount, mode, hasFlowSensor, pulsesPerLiter, txPacket.packet_id);
 }
 
 // Вся содержательная обработка входящего пакета - раньше жила прямо в
@@ -610,25 +616,30 @@ void handleApiForget() {
     server.send(200, "text/plain", "ok");
 }
 
-// POST /api/setConfig - form-urlencoded: idx, valveCount, mode.
+// POST /api/setConfig - form-urlencoded: idx, valveCount, mode, hasFlowSensor, pulsesPerLiter.
 // Конфигурация (в отличие от /api/command) хранится НА САМОМ узле (EEPROM) и
 // переживает его перезагрузку - см. sendSetConfig() и GardenProtocol.h
 // (MSG_SET_CONFIG). Работает и для не-установленных кандидатов - как и
 // /api/command (см. его комментарий), можно настроить устройство ДО того, как
 // решить его устанавливать.
 void handleApiSetConfig() {
-    if (!server.hasArg("idx") || !server.hasArg("valveCount") || !server.hasArg("mode")) {
-        server.send(400, "text/plain", "missing idx, valveCount or mode");
+    if (!server.hasArg("idx") || !server.hasArg("valveCount") || !server.hasArg("mode") ||
+        !server.hasArg("hasFlowSensor") || !server.hasArg("pulsesPerLiter")) {
+        server.send(400, "text/plain", "missing idx, valveCount, mode, hasFlowSensor or pulsesPerLiter");
         return;
     }
     int idx = server.arg("idx").toInt();
     int valveCount = server.arg("valveCount").toInt();
     int mode = server.arg("mode").toInt();
-    if (valveCount < 1 || valveCount > 5 || (mode != 1 && mode != 2)) {
-        server.send(400, "text/plain", "invalid valveCount or mode");
+    int hasFlowSensor = server.arg("hasFlowSensor").toInt();
+    int pulsesPerLiter = server.arg("pulsesPerLiter").toInt();
+    if (valveCount < 1 || valveCount > 5 || (mode != 1 && mode != 2) ||
+        (hasFlowSensor != 0 && hasFlowSensor != 1) ||
+        pulsesPerLiter < 1 || pulsesPerLiter > 20000) {
+        server.send(400, "text/plain", "invalid valveCount, mode, hasFlowSensor or pulsesPerLiter");
         return;
     }
-    sendSetConfig(idx, (uint8_t) valveCount, (uint8_t) mode);
+    sendSetConfig(idx, (uint8_t) valveCount, (uint8_t) mode, (uint8_t) hasFlowSensor, (uint16_t) pulsesPerLiter);
     server.send(200, "text/plain", "ok");
 }
 
@@ -812,7 +823,8 @@ void setup() {
     Serial.println("Веб-сервер запущен.");
 
     Serial.println("Serial-команды: list | open <idx> <valve> <sec> | volume <idx> <valve> <liters> | "
-                    "close <idx> [valve] | config <idx> <valves> <mode> | install <idx> | forget <idx> | rename <idx> <name> | time");
+                    "close <idx> [valve] | config <idx> <valves> <mode> <hasFlowSensor> <pulsesPerLiter> | "
+                    "install <idx> | forget <idx> | rename <idx> <name> | time");
 
     // Объявляем о своей (пере)загрузке всем узлам сети - см. sendHubAnnounce().
     // Несколько повторов с паузой, а не один пакет, на случай потерь в эфире.
