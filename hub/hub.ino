@@ -117,6 +117,60 @@
 const char *AP_SSID = "SmartGarden-Hub";
 const char *AP_PASSWORD = "garden123";
 
+// --- Мощность передатчика Wi-Fi/ESP-NOW (оба используют один и тот же
+// радиотракт, настройка общая для обоих) - WiFi.setTxPower()/WiFi.getTxPower()
+// из ядра arduino-esp32 принимают/возвращают значения типа wifi_power_t -
+// фиксированный набор дискретных шагов (не любое целое число дБм), численно
+// равный четвертям дБм × 4 (например, 19.5 дБм = 78) - завёрнут аппаратного API,
+// мы их не придумываем заново. Список выбираемого на веб-странице (см. WebPage.h) собран
+// из всех значений этого enum - валидация входящего в handleApiSetTxPower() ниже сверяется
+// С ЭТИМ СПИСКОМ, а не просто с диапазоном чисел - произвольное число в диапазоне
+// было бы невалидным значением этого enum и могло бы дать непредсказуемое
+// поведение драйвера. УМЕНЬШЕНИЕ мощности сокращает дальность связи и может
+// пригодиться для соблюдения регуляторных ограничений или снижения взаимных помех между
+// несколькими изделиями в помещении.
+//
+// Не сохраняется в NVS намеренно (как и apEnabled выше) - каждый сброс Хаба
+// возвращает максимальную мощность (дефолт самого Wi-Fi-драйвера после
+// WiFi.mode()) - это безопасный дефолт для связи с узлами (отличие от точки
+// доступа - меньшая мощность не создаёт такой поверхности атаки, как
+// включённая по умолчанию точка доступа - поэтому персистировать её не требовалось).
+struct TxPowerOption {
+    wifi_power_t value;
+    const char *label; // для Serial-лога и как подсказка при отладке - веб-страница сама
+                        // форматирует текст из числа (см. WebPage.h), это поле ей не отдаётся.
+};
+const TxPowerOption TX_POWER_OPTIONS[] = {
+    {WIFI_POWER_19_5dBm, "19.5 dBm"},
+    {WIFI_POWER_19dBm, "19 dBm"},
+    {WIFI_POWER_18_5dBm, "18.5 dBm"},
+    {WIFI_POWER_17dBm, "17 dBm"},
+    {WIFI_POWER_15dBm, "15 dBm"},
+    {WIFI_POWER_13dBm, "13 dBm"},
+    {WIFI_POWER_11dBm, "11 dBm"},
+    {WIFI_POWER_8_5dBm, "8.5 dBm"},
+    {WIFI_POWER_7dBm, "7 dBm"},
+    {WIFI_POWER_5dBm, "5 dBm"},
+    {WIFI_POWER_2dBm, "2 dBm"},
+    {WIFI_POWER_MINUS_1dBm, "-1 dBm"},
+};
+#define TX_POWER_OPTIONS_COUNT (sizeof(TX_POWER_OPTIONS) / sizeof(TX_POWER_OPTIONS[0]))
+
+// --- Частота процессора ---
+// arduino-esp32 позволяет менять частоту CPU на лету через setCpuFrequencyMhz()/
+// getCpuFrequencyMhz() (esp32-hal-cpu.h, не требует отдельного #include - часть ядра,
+// подключается автоматически вместе с Arduino.h). СНИЖЕНИЕ частоты сокращает
+// энергопотребление и тепловыделение, но СТОИТ осторожно - при активном Wi-Fi/ESP-NOW
+// (а они активны всегда, как только Хаб работает) надёжно поддержаны только 240/160/80 МГц -
+// меньшие значения (40/20/10) требуют отключения PLL и на практике ломают ESP-NOW/Wi-Fi
+// (или вовсе не применяются - setCpuFrequencyMhz() вернёт false, см. handleApiSetCpuFreq() ниже) -
+// восстановить связь в таком случае может потребовать физического сброса Хаба на месте -
+// поэтому в список выбора на веб-странице (см. WebPage.h) сознательно не включаются ниже 80 МГц.
+// То же самое, что и с TX_POWER_OPTIONS выше: не сохраняется в NVS - каждый сброс Хаба возвращает
+// максимальную частоту (дефолт ядра после загрузки) - безопасный дефолт.
+const uint32_t CPU_FREQ_OPTIONS[] = {240, 160, 80};
+#define CPU_FREQ_OPTIONS_COUNT (sizeof(CPU_FREQ_OPTIONS) / sizeof(CPU_FREQ_OPTIONS[0]))
+
 // Имя хоста для mDNS (протокол "Bonjour"/"zeroconf", в Linux обычно
 // реализован через avahi) - см. большой комментарий про домен в начале
 // файла.
@@ -157,13 +211,20 @@ QueueHandle_t incomingPacketQueue = nullptr;
 // --- Кнопка/точка доступа ---
 //
 // Физическая кнопка на плате включает/выключает точку доступа
-// веб-интерфейса (антидребезг - см. ApButton.h). Состояние ПЕРЕЖИВАЕТ
-// перезагрузку Хаба - сохраняется в NVS при каждом нажатии и
-// восстанавливается в setup() (см. loadApEnabledFromNVS()/
-// saveApEnabledToNVS() ниже) - то есть после перезагрузки Хаб
-// возвращается в то же состояние AP, в котором был до этого, а не
-// всегда стартует с выключенной. Только для самого первого запуска
-// (когда в NVS ещё ничего не сохранено) действует дефолт "выключена".
+// веб-интерфейса (антидребезг - см. ApButton.h). СОСТОЯНИЕ НЕ ПЕРЕЖИВАЕТ
+// перезагрузку Хаба - НИКАК НЕ сохраняется в NVS намеренно: каждый сброс Хаба
+// всегда стартует с выключенной точкой доступа (так надёжнее по умолчанию, чем
+// восстанавливать прежнее состояние - открытая вечно точка доступа после любого
+// сбоя/перезагрузки - лишняя поверхность атаки в поле). Оператор включает её явно
+// каждый раз, когда она нужна.
+//
+// АВТО-ОТКЛЮЧЕНИЕ: если точка доступа включена, но к ней больше AP_AUTO_OFF_MS подряд
+// ни одного клиента не подключено (см. updateApAutoOff() ниже, WiFi.softAPgetStationNum()) - она
+// выключается сама - чтобы не держать радиоэфир открытым бессрочно, если оператор
+// забыл её выключить вручную. Отсчёт начинается заново при каждом отключении последнего
+// клиента (или с момента включения AP, если никто так и не подключился) - любое новое
+// подключение его сбрасывает.
+//
 // Пока AP выключена, устройство всё равно продолжает принимать и
 // обрабатывать ESP-NOW трафик от узлов - выключена именно точка
 // доступа для веб-интерфейса, а не радио целиком.
@@ -180,7 +241,16 @@ QueueHandle_t incomingPacketQueue = nullptr;
 #define AP_LED_PIN 2
 const unsigned long AP_BUTTON_DEBOUNCE_MS = 50;
 
-bool apEnabled = false; // выключена при старте - реальное значение восстановит setup() из NVS
+// 5 минут без ни одного подключённого к точке доступа клиента - автоматически
+// выключаем (см. updateApAutoOff() ниже).
+#define AP_AUTO_OFF_MS (5UL * 60UL * 1000UL)
+
+bool apEnabled = false; // выключена при старте - и НАВСЕГДА (нет NVS-восстановления прежнего
+                        // состояния, см. комментарий выше)
+
+// 0 - таймер не запущен (есть хотя бы одно подключение, или AP и так выключена);
+// иначе - millis() момента, с которого ни одного клиента не было - см. updateApAutoOff().
+unsigned long apNoClientsSinceMs = 0;
 
 // --- Часы ---
 
@@ -396,27 +466,6 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
 
 // --- Кнопка/точка доступа/статус радио ---
 
-// Персистентность состояния точки доступа - намеренно НЕ через
-// DeviceManager (это не про таблицу устройств), просто отдельный ключ в
-// том же NVS-неймспейсе - заводить под один bool целый класс избыточно.
-const char *AP_NVS_NAMESPACE = "smartgarden";
-const char *AP_NVS_KEY = "apEnabled";
-
-bool loadApEnabledFromNVS() {
-    Preferences prefs;
-    prefs.begin(AP_NVS_NAMESPACE, true); // read-only
-    bool enabled = prefs.getBool(AP_NVS_KEY, false); // false - дефолт для самого первого запуска
-    prefs.end();
-    return enabled;
-}
-
-void saveApEnabledToNVS(bool enabled) {
-    Preferences prefs;
-    prefs.begin(AP_NVS_NAMESPACE, false);
-    prefs.putBool(AP_NVS_KEY, enabled);
-    prefs.end();
-}
-
 // (Пере)запускает mDNS-отклик - вызывается вместе с включением точки
 // доступа (см. setApEnabled()), поскольку резолвить имя есть смысл
 // только пока есть что резолвить (сама точка доступа поднята). При
@@ -433,18 +482,14 @@ void restartMDNS() {
     }
 }
 
-// Включает или выключает точку доступа веб-интерфейса и синхронно
-// зажигает/гасит светодиод платы (если радио в порядке - см.
-// updateStatusLed()) - вызывается из loop() по нажатию кнопки, но
-// пригодится и для отладки. persist указывается явно (без значения по
-// умолчанию - Arduino IDE автогенерирует прототип функции из её
-// определения, и default-значение аргумента пришлось бы дважды - это
-// ошибка компиляции C++). true - сохранить новое состояние в NVS (так
-// вызывается при нажатии кнопки, см. loop()); false - не сохранять, так
-// вызывается только при восстановлении состояния из самой же NVS в
-// setup() - значение и так уже там.
-void setApEnabled(bool enabled, bool persist) {
+// Включает или выключает точку доступа веб-интерфейса - вызывается из loop() по
+// нажатию кнопки или автоматически из updateApAutoOff() ниже (отсутствие клиентов
+// 5 минут). СОСТОЯНИЕ НИКУДА НЕ СОХРАНЯЕТСЯ (в отличие от более ранней
+// версии - см. большой комментарий у apEnabled выше), поэтому у функции больше
+// нет параметра persist.
+void setApEnabled(bool enabled) {
     apEnabled = enabled;
+    apNoClientsSinceMs = 0; // любое изменение состояния сбрасывает таймер авто-отключения
     if (apEnabled) {
         WiFi.softAP(AP_SSID, AP_PASSWORD, ESPNOW_CHANNEL);
         Serial.print("Точка доступа ВКЛЮЧЕНА: "); Serial.println(AP_SSID);
@@ -458,10 +503,30 @@ void setApEnabled(bool enabled, bool persist) {
     if (radioReady) {
         // Пока радио не готово, светодиодом безраздельно управляет
         // updateStatusLed() (мигание отказа) - см. там же.
-        digitalWrite(AP_LED_PIN, apEnabled ? HIGH : LOW);
+        //digitalWrite(AP_LED_PIN, apEnabled ? HIGH : LOW);
     }
-    if (persist) {
-        saveApEnabledToNVS(apEnabled);
+}
+
+// Вызывается каждую итерацию loop() - см. большой комментарий про АВТО-ОТКЛЮЧЕНИЕ
+// у apEnabled выше. WiFi.softAPgetStationNum() - число СЕЙЧАС подключённых к
+// точке доступа Wi-Fi-станций (телефонов/ноутбуков с открытой веб-страницей или без
+// неё) - не требует отдельного учёта со стороны Самого Хаба.
+void updateApAutoOff() {
+    if (!apEnabled) {
+        apNoClientsSinceMs = 0; // не считаем, пока AP и так выключена
+        return;
+    }
+    if (WiFi.softAPgetStationNum() > 0) {
+        apNoClientsSinceMs = 0; // есть хотя бы одно подключение - сбрасываем отсчёт
+        return;
+    }
+    if (apNoClientsSinceMs == 0) {
+        apNoClientsSinceMs = millis(); // подключений нет - начинаем отсчёт
+        return;
+    }
+    if (millis() - apNoClientsSinceMs >= AP_AUTO_OFF_MS) {
+        Serial.println("Точка доступа: нет активных подключений 5 минут подряд - выключаю автоматически.");
+        setApEnabled(false);
     }
 }
 
@@ -484,7 +549,7 @@ void updateStatusLed() {
     if (millis() - lastRadioFailBlinkMs > RADIO_FAIL_BLINK_MS) {
         lastRadioFailBlinkMs = millis();
         radioFailLedState = !radioFailLedState;
-        digitalWrite(AP_LED_PIN, radioFailLedState ? HIGH : LOW);
+       // digitalWrite(AP_LED_PIN, radioFailLedState ? HIGH : LOW);
     }
 }
 
@@ -697,11 +762,12 @@ void handleApiSetTime() {
     server.send(200, "text/plain", "ok");
 }
 
-// GET /api/status - служебная информация Хаба: часы, точка доступа и
-// время работы с момента сброса (uptimeSec) - веб-страница опрашивает
-// это в том же цикле автообновления, что и /api/devices, чтобы показать
-// оператору визуальное подтверждение, что синхронизация времени
-// сработала, и как долго Хаб уже работает без перезагрузки.
+// GET /api/status - служебная информация Хаба: часы, точка доступа,
+// время работы с момента сброса (uptimeSec), температура кристалла, текущая
+// мощность передатчика и текущая частота процессора - веб-страница опрашивает это
+// в том же цикле автообновления, что и /api/devices, чтобы показать оператору визуальное
+// подтверждение, что синхронизация времени сработала, как долго Хаб уже
+// работает без перезагрузки, и текущее состояние радио/процессора.
 void handleApiStatus() {
     String json = "{";
     json += "\"timeSynced\":" + String(timeSynced ? "true" : "false");
@@ -717,15 +783,76 @@ void handleApiStatus() {
     // дней/часов работы хаба это в практике несущественно (перезагрузка раньше всё
     // равно сбросила бы этот счётчик).
     json += ",\"uptimeSec\":" + String((unsigned long) (millis() / 1000));
+    // Температура кристалла ESP32 (встроенный датчик, не окружающей среды!) через
+    // temperatureRead() из ядра arduino-esp32, в °C - точность этого встроенного датчика
+    // умеренная (калибровка заводская, погрешность порядка нескольких градусов возможна)
+    // - для грубого контроля перегрева/адекватности теплового режима этого вполне
+    // достаточно, для прецизионных измерений - нет. String(float) округляет до 2 знаков после запятой
+    // по умолчанию - достаточно для отображения.
+    json += ",\"chipTempC\":" + String(temperatureRead(), 1);
+    // Текущая мощность передатчика - сырое число в четвертях дБм (см. TxPowerOption выше,
+    // wifi_power_t неявно конвертируется в int) - веб-страница сама делит на 4 для отображения.
+    json += ",\"txPowerQuarterDbm\":" + String((int) WiFi.getTxPower());
+    // Текущая частота процессора - см. CPU_FREQ_OPTIONS выше.
+    json += ",\"cpuFreqMhz\":" + String(getCpuFrequencyMhz());
     json += "}";
     server.send(200, "application/json", json);
+}
+
+// POST /api/setTxPower - form-urlencoded: value (целое число в четвертях дБм, то есть сырое значение
+// wifi_power_t - см. TX_POWER_OPTIONS выше). Обязательно сверяется С НАБОРОМ допустимых
+// значений, а НЕ с диапазоном чисел - см. комментарий у TX_POWER_OPTIONS выше, почему это
+// важно. Влияет СРАЗУ (без перезагрузки радио) и НЕ сохраняется между
+// перезагрузками (см. комментарий у TX_POWER_OPTIONS выше).
+void handleApiSetTxPower() {
+    if (!server.hasArg("value")) {
+        server.send(400, "text/plain", "missing value");
+        return;
+    }
+    int requested = server.arg("value").toInt();
+    for (size_t i = 0; i < TX_POWER_OPTIONS_COUNT; i++) {
+        if ((int) TX_POWER_OPTIONS[i].value == requested) {
+            WiFi.setTxPower(TX_POWER_OPTIONS[i].value);
+            Serial.printf("Мощность передатчика установлена: %s\n", TX_POWER_OPTIONS[i].label);
+            server.send(200, "text/plain", "ok");
+            return;
+        }
+    }
+    server.send(400, "text/plain", "invalid value - not in the known wifi_power_t set");
+}
+
+// POST /api/setCpuFreq - form-urlencoded: value (целое число в МГц, см. CPU_FREQ_OPTIONS выше).
+// Сверяется С НАБОРОМ допустимых значений - та же логика, что и у handleApiSetTxPower() выше.
+// setCpuFrequencyMhz() возвращает bool - может отказаться (неверный делитель для текущего
+// источника тактовой частоты), проверяем его и отвечаем честно, а не всегда "ok".
+void handleApiSetCpuFreq() {
+    if (!server.hasArg("value")) {
+        server.send(400, "text/plain", "missing value");
+        return;
+    }
+    int requested = server.arg("value").toInt();
+    for (size_t i = 0; i < CPU_FREQ_OPTIONS_COUNT; i++) {
+        if ((int) CPU_FREQ_OPTIONS[i] == requested) {
+            bool ok = setCpuFrequencyMhz(CPU_FREQ_OPTIONS[i]);
+            if (ok) {
+                Serial.printf("Частота процессора установлена: %u МГц\n", (unsigned) CPU_FREQ_OPTIONS[i]);
+                server.send(200, "text/plain", "ok");
+            } else {
+                Serial.printf("Не удалось установить частоту процессора %u МГц (отклонено ядром)\n",
+                              (unsigned) CPU_FREQ_OPTIONS[i]);
+                server.send(500, "text/plain", "core rejected this frequency");
+            }
+            return;
+        }
+    }
+    server.send(400, "text/plain", "invalid value - not in the allowed set");
 }
 
 void setup() {
     Serial.begin(115200);
 
     pinMode(AP_LED_PIN, OUTPUT);
-    digitalWrite(AP_LED_PIN, LOW); // безопасный начальный дефолт - реальное состояние выставит setApEnabled() ниже, после восстановления из NVS
+ //   digitalWrite(AP_LED_PIN, LOW); // безопасный начальный дефолт - реальное состояние выставит setApEnabled(), когда оператор явно включит AP
     apButton.begin(AP_BUTTON_PIN, AP_BUTTON_DEBOUNCE_MS);
 
     // --- DS3231 ---
@@ -802,13 +929,10 @@ void setup() {
                         "проблема не устранена (проверьте прошивку/питание/антенну).");
     }
 
-    // Восстанавливаем состояние точки доступа из NVS - УЖЕ ПОСЛЕ того, как
-    // определился radioReady выше - setApEnabled() использует его, чтобы корректно
-    // выставить светодиод (если бы это сделалось раньше, до определения
-    // radioReady, включённая ранее точка доступа ничем визуально не отмечалась бы на
-    // светодиоде, пока радио ещё не готово). persist=false - значение и так уже
-    // взято из NVS, перезаписывать его же самое в ответ не надо.
-    setApEnabled(loadApEnabledFromNVS(), false);
+    // Точка доступа при старте всегда выключена (apEnabled уже инициализирована в false выше,
+    // и НИКАКОГО NVS-восстановления больше нет - см. большой комментарий у apEnabled выше),
+    // поэтому вызывать setApEnabled() здесь не надо - WiFi.softAP() и так не вызывается,
+    // пока оператор явно не нажмёт кнопку.
 
     server.on("/", HTTP_GET, handleRoot);
     server.on("/api/devices", HTTP_GET, handleApiDevices);
@@ -819,6 +943,8 @@ void setup() {
     server.on("/api/rename", HTTP_POST, handleApiRename);
     server.on("/api/settime", HTTP_POST, handleApiSetTime);
     server.on("/api/status", HTTP_GET, handleApiStatus);
+    server.on("/api/setTxPower", HTTP_POST, handleApiSetTxPower);
+    server.on("/api/setCpuFreq", HTTP_POST, handleApiSetCpuFreq);
     server.begin();
     Serial.println("Веб-сервер запущен.");
 
@@ -841,8 +967,9 @@ void setup() {
 
 void loop() {
     if (apButton.wasPressed()) {
-        setApEnabled(!apEnabled, true);
+        setApEnabled(!apEnabled);
     }
+    updateApAutoOff();
     updateStatusLed();
 
     server.handleClient();

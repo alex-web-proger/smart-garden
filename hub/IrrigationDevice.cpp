@@ -12,6 +12,7 @@ void IrrigationDevice::handlePayload(int idx, const UniversalPacket &pkt) {
     } else if (pkt.msg_type == MSG_TELEMETRY) {
         IrrigationTelemetry t = pkt.payload.irrigation.telemetry;
         lastActiveValvesMask = t.active_valves; // кэш для веб-интерфейса
+        lastTotalWaterUsed = t.total_water_used; // то же для накопленного расхода (см. IrrigationDevice.h)
         Serial.printf("TELEMETRY (IRRIGATION) от #%d: active_valves=0x%02X current_flow=%lu total_water_used=%lu\n",
                       idx, t.active_valves, (unsigned long) t.current_flow, (unsigned long) t.total_water_used);
     } else {
@@ -28,4 +29,5 @@ void IrrigationDevice::appendJsonFields(String &json) const {
     json += ",\"mode\":" + String(mode);
     json += ",\"hasFlowSensor\":" + String(hasFlowSensor);
     json += ",\"flowPulsesPerLiter\":" + String(flowPulsesPerLiter);
+    json += ",\"totalWaterUsed\":" + String(lastTotalWaterUsed);
 }

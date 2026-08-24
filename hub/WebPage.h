@@ -18,16 +18,25 @@
 // это нет, да и не нужно для беглого взгляда на состояние сети.
 //
 // КОНФИГУРАЦИЯ МОДУЛЯ: /api/devices отдаёт реальные valveCount/mode/hasFlowSensor/
-// flowPulsesPerLiter узла (см. IrrigationDevice в hub/IrrigationDevice.h) - модальное окно рисует
-// РОВНО столько клапанов, сколько сейчас сконфигурировано на самом
-// узле (0, пока первый MSG_CONFIG от него ещё не пришёл - тогда секция
-// клапанов временно пуста). Тут же, ниже клапанов - сектор "Конфигурация
-// модуля" с количеством каналов (1-5), режимом работы (1/2), наличием датчика
-// потока (чекбокс) и его разрешением (импульсов на литр) - изменения уходят на
+// flowPulsesPerLiter/totalWaterUsed узла (см. IrrigationDevice в hub/IrrigationDevice.h) - раздел
+// "Управление" в модальном окне рисует РОВНО столько клапанов, сколько сейчас
+// сконфигурировано на самом узле (0, пока первый MSG_CONFIG от него ещё не пришёл -
+// тогда секция клапанов временно пуста), а при hasFlowSensor==true ещё и накопленный
+// объём воды с момента последнего сброса узла (сам датчик ещё не реализован узлом, см.
+// TODO у fillTelemetry() в flow_node.ino - пока всегда 0). Тут же, ниже - сектор "Конфигурация
+// модуля" (сворачиваемый, по умолчанию закрыт, <details>/<summary>) с количеством
+// каналов (1-5), режимом работы (1/2), наличием датчика потока (чекбокс) и его
+// разрешением (импульсов на литр) - изменения уходят на
 // Хаб через POST /api/setConfig, который отправляет узлу MSG_SET_CONFIG; узел сам
 // валидирует, применяет и СОХРАНЯЕТ конфигурацию у себя (EEPROM, переживает его
 // перезагрузку) - см. GardenProtocol.h/PROTOCOL.md §3.2 и onSetConfig() в
 // flow_node.ino.
+//
+// САМ ХАБ (не узел): под строкой времени/uptime — температура кристалла ESP32, мощность
+// передатчика Wi-Fi/ESP-NOW и частота процессора, все три read+write через /api/status
+// (GET) и /api/setTxPower, /api/setCpuFreq (POST) — см. handleApiStatus()/
+// handleApiSetTxPower()/handleApiSetCpuFreq() в hub.ino. Ни то, ни другое НЕ сохраняется
+// между перезагрузками Хаба — оба возвращаются к безопасному максимуму при каждом сбросе.
 //
 // НАЗВАНИЕ УСТРОЙСТВА: карточка показывает его вместо "Узел #idx", если
 // оно задано - редактируется в модальном окне (поле "Название" + кнопка
@@ -53,7 +62,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   #time-status { font-size: 0.85em; margin-bottom: 4px; }
   .time-synced { color:#2a7d2a; }
   .time-unsynced { color:#b8860b; }
-  #uptime-status { font-size: 0.85em; margin-bottom: 16px; color:#666; }
+  #uptime-status { font-size: 0.85em; margin-bottom: 4px; color:#666; }
+  #hub-radio-status { font-size: 0.85em; margin-bottom: 16px; color:#666; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  #hub-radio-status select { padding:2px 4px; border:1px solid #ccc; border-radius:4px; font-size:0.85em; }
+  #temp-value.temp-hot { color:#c0392b; font-weight:600; }
 
   .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
   .empty { padding: 30px; text-align:center; color:#999; background:#fff; border-radius:10px; }
@@ -93,7 +105,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .modal-header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:4px; gap:10px; }
   .modal-header h2 { margin:0; font-size:1.1em; }
   .modal-close { border:none; background:none; font-size:22px; line-height:1; cursor:pointer; color:#888; padding:0 4px; }
-  .modal-sub { font-size:0.8em; color:#888; margin-bottom:14px; }
 
   .modal-field { font-size:0.85em; margin-bottom:6px; color:#444; display:flex; justify-content:space-between; gap:10px; align-items:center; }
   .modal-field b { color:#222; font-weight:600; }
@@ -115,7 +126,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .valve-state.closed { color:#999; }
 
   .config-section { margin-top:14px; border-top:1px solid #eee; padding-top:12px; }
-  .config-section h3 { font-size:0.9em; margin:0 0 8px; }
+  .config-section summary { font-size:0.9em; margin:0 0 8px; cursor:pointer; font-weight:600; }
+  .config-section[open] summary { margin-bottom:8px; }
   .config-row { font-size:0.85em; margin-bottom:10px; display:flex; align-items:center; justify-content:space-between; gap:8px; }
   .config-row input, .config-row select { padding:4px 6px; border:1px solid #ccc; border-radius:4px; font-size:0.85em; }
   .config-row input[type=number] { width:55px; }
@@ -142,7 +154,21 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <span class="legend-dot" style="background:#d8860a"></span>Кандидат, не установлено (нажмите ⚙, чтобы установить)
 </div>
 <div id="time-status" class="time-unsynced">Синхронизация времени...</div>
-<div id="uptime-status" class="uptime-status">Время работы: —</div>
+<div id="uptime-status">Время работы: —</div>
+<!-- Температура кристалла и мощность передатчика САМОГО Хаба (не узла!) - см.
+     refreshStatus()/txPowerChanged() в скрипте. Список в <select> строится из TX_POWER_OPTIONS ниже —
+     тот же набор значений wifi_power_t, что и в hub.ino (TX_POWER_OPTIONS там) — дублируется вручную,
+     потому что это JS, а не C++, общего enum'а между ними нет (та же ситуация, что с ACTION_OPEN/
+     ACTION_CLOSE выше в valveButtonClick()). -->
+<div id="hub-radio-status">
+  <span>Температура Хаба: <b id="temp-value">—</b></span>
+  <span>Мощность передатчика:
+    <select id="tx-power-select" onchange="setTxPower(this)"></select>
+  </span>
+  <span>Частота процессора:
+    <select id="cpu-freq-select" onchange="setCpuFreq(this)"></select>
+  </span>
+</div>
 
 <div class="grid" id="devices-grid"><div class="empty">Загрузка...</div></div>
 
@@ -154,8 +180,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <h2 id="modal-title">Устройство</h2>
       <button class="modal-close" onclick="closeModal()">×</button>
     </div>
-    <div class="modal-sub" id="modal-sub"></div>
-
     <div class="modal-field"><span>MAC-адрес</span><b id="modal-mac">—</b></div>
     <div class="modal-field"><span>Связь</span><b id="modal-conn">—</b></div>
     <div class="modal-field"><span>Статус</span><span id="modal-status" class="status-pill">—</span></div>
@@ -342,7 +366,6 @@ function closeModal() {
 // окна), а не на каждый фоновый refresh() - иначе набранное
 // пользователем значение стиралось бы каждые 2 сек.
 function updateModal(d) {
-  document.getElementById('modal-sub').textContent = 'MAC ' + d.mac;
   document.getElementById('modal-mac').textContent = d.mac;
   document.getElementById('modal-conn').textContent = d.agoSec + ' с назад';
 
@@ -387,10 +410,11 @@ function updateModal(d) {
     // см. updateIrrigationLiveState() ниже.
     const needsRebuild = !typeSpecificBuiltFor ||
                           typeSpecificBuiltFor.idx !== d.idx ||
-                          typeSpecificBuiltFor.valveCount !== d.valveCount;
+                          typeSpecificBuiltFor.valveCount !== d.valveCount ||
+                          typeSpecificBuiltFor.hasFlowSensor !== d.hasFlowSensor;
     if (needsRebuild) {
       buildIrrigationTypeSpecific(d);
-      typeSpecificBuiltFor = { idx: d.idx, valveCount: d.valveCount };
+      typeSpecificBuiltFor = { idx: d.idx, valveCount: d.valveCount, hasFlowSensor: d.hasFlowSensor };
     }
     updateIrrigationLiveState(d);
   } else {
@@ -437,7 +461,10 @@ function buildIrrigationTypeSpecific(d) {
 
   typeSpecific.innerHTML =
     '<div class="valve-section">' +
-      '<h3>Клапаны</h3>' +
+      '<h3>Управление</h3>' +
+      (d.hasFlowSensor
+        ? '<div class="modal-field"><span>Израсходовано воды</span><b id="modal-water-used">—</b></div>'
+        : '') +
       (d.valveCount > 0
         ? ('<div class="duration-row">' +
              '<label for="modal-duration">Длительность открытия, сек:</label>' +
@@ -447,8 +474,8 @@ function buildIrrigationTypeSpecific(d) {
            rows)
         : '<span style="color:#999;font-size:0.85em;">Ожидание конфигурации от устройства...</span>') +
     '</div>' +
-    '<div class="config-section">' +
-      '<h3>Конфигурация модуля</h3>' +
+    '<details class="config-section">' +
+      '<summary>Конфигурация модуля</summary>' +
       '<div class="config-row">' +
         '<label for="modal-cfg-valves">Количество каналов</label>' +
         '<input type="number" min="1" max="5" id="modal-cfg-valves" value="' + cfgValvesValue + '">' +
@@ -471,7 +498,7 @@ function buildIrrigationTypeSpecific(d) {
       '<div class="config-hint">Наличие датчика и его разрешение нужно указать вручную по модели вашего датчика (например, YF-S201 — 450 имп/л) — узел не умеет определить это сам.</div>' +
       '<div class="config-hint">Хранится на самом устройстве и переживает его перезагрузку.</div>' +
       '<button class="apply-btn" onclick="saveModuleConfig(this, ' + d.idx + ')">Применить</button>' +
-    '</div>';
+    '</details>';
 }
 
 // Точечное обновление состояния клапанов/подсказки режима - вызывается НА
@@ -480,6 +507,12 @@ function buildIrrigationTypeSpecific(d) {
 // выпадающего списка режима (см. buildIrrigationTypeSpecific() выше). Если d.valveCount<=0
 // (ещё нет конфигурации от узла) - обновлять нечего, показывается заглушка "ожидание".
 function updateIrrigationLiveState(d) {
+  // Объём воды с момента последнего сброса узла (totalWaterUsed из /api/devices, см.
+  // IrrigationDevice::lastTotalWaterUsed) - элемент существует в DOM ТОЛЬКО при d.hasFlowSensor==true (см.
+  // buildIrrigationTypeSpecific()) - без датчика строки просто нет, и этот блок молча пропускает.
+  const waterUsedEl = document.getElementById('modal-water-used');
+  if (waterUsedEl) waterUsedEl.textContent = d.totalWaterUsed + ' л';
+
   if (d.valveCount <= 0) return;
   for (let v = 1; v <= d.valveCount; v++) {
     const row = document.getElementById('valve-row-' + v);
@@ -710,9 +743,108 @@ async function refreshStatus() {
     if (typeof status.uptimeSec === 'number') {
       uptimeEl.textContent = 'Время работы с момента сброса: ' + formatUptime(status.uptimeSec);
     }
+
+    // Температура кристалла Самого Хаба (chipTempC из /api/status, см. temperatureRead() в
+    // handleApiStatus() в hub.ino) - подсвечиваем красным, если заметно горячее (порог чисто
+    // для визуального внимания, не аварийный порог - встроенный датчик ESP32 всё равно не
+    // точен, см. комментарий в hub.ino).
+    const tempEl = document.getElementById('temp-value');
+    if (typeof status.chipTempC === 'number') {
+      tempEl.textContent = status.chipTempC.toFixed(1) + ' °C';
+      tempEl.classList.toggle('temp-hot', status.chipTempC >= 75);
+    }
+
+    // Мощность передатчика (txPowerQuarterDbm из /api/status, сырое число в четвертях дБм,
+    // точно то же, что возвращает WiFi.getTxPower() на Хабе) - список опций строится ОДИН
+    // РАЗ (populateTxPowerOptions() ниже), а дальше каждый тик просто ставится текущее значение -
+    // в отличие от секции конфигурации узла выше, здесь нет риска "самопроизвольного закрытия"
+    // выпадающего списка - мы НЕ пересобираем сам select (только меняем .value), а сами <option> уже
+    // в DOM одноразово.
+    const txSelect = document.getElementById('tx-power-select');
+    if (txSelect.options.length === 0) populateTxPowerOptions(txSelect);
+    if (typeof status.txPowerQuarterDbm === 'number' && document.activeElement !== txSelect) {
+      // document.activeElement !== txSelect - не перезатираем выбор пользователя, пока он именно
+      // сейчас открыт/в фокусе у этого select - та же логика, что и для полей ввода выше.
+      txSelect.value = String(status.txPowerQuarterDbm);
+    }
+
+    // Частота процессора (cpuFreqMhz из /api/status, см. getCpuFrequencyMhz() в hub.ino) - то же
+    // самое обращение, что и с мощностью передатчика выше - список один раз, значение каждый тик.
+    const cpuSelect = document.getElementById('cpu-freq-select');
+    if (cpuSelect.options.length === 0) populateCpuFreqOptions(cpuSelect);
+    if (typeof status.cpuFreqMhz === 'number' && document.activeElement !== cpuSelect) {
+      cpuSelect.value = String(status.cpuFreqMhz);
+    }
   } catch (e) {
     console.error('Не удалось получить статус Хаба', e);
   }
+}
+
+// Список допустимых значений мощности передатчика - должен точно совпадать с
+// TX_POWER_OPTIONS в hub.ino (те же значения wifi_power_t, численно равные четвертям
+// дБм) - если там список когда-нибудь изменится - править и здесь.
+const TX_POWER_OPTIONS = [
+  [78, '19.5 дБм'], [76, '19 дБм'], [74, '18.5 дБм'], [68, '17 дБм'],
+  [60, '15 дБм'], [52, '13 дБм'], [44, '11 дБм'], [34, '8.5 дБм'],
+  [28, '7 дБм'], [20, '5 дБм'], [8, '2 дБм'], [-4, '-1 дБм'],
+];
+
+function populateTxPowerOptions(selectEl) {
+  TX_POWER_OPTIONS.forEach(([value, label]) => {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = label;
+    selectEl.appendChild(opt);
+  });
+}
+
+// Вызывается при выборе значения в <select> (onchange, см. разметку выше) - меняет
+// мощность передатчика САМОГО ХАБА (не узла!) через POST /api/setTxPower - см.
+// handleApiSetTxPower() в hub.ino. Никакого отдельного подтверждения на самом select не нужно - изменение
+// мощности применяется СРАЗУ на стороне Хаба, без перезагрузки радио.
+async function setTxPower(selectEl) {
+  try {
+    await fetch('/api/setTxPower', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'value=' + selectEl.value
+    });
+  } catch (e) {
+    console.error('Не удалось изменить мощность передатчика', e);
+  }
+  refreshStatus();
+}
+
+// Список допустимых частот процессора (МГц) - должен точно совпадать с
+// CPU_FREQ_OPTIONS в hub.ino (там же пояснение, почему только 240/160/80 - меньшие частоты
+// ломают ESP-NOW/Wi-Fi при активном радио).
+const CPU_FREQ_OPTIONS = [240, 160, 80];
+
+function populateCpuFreqOptions(selectEl) {
+  CPU_FREQ_OPTIONS.forEach((mhz) => {
+    const opt = document.createElement('option');
+    opt.value = mhz;
+    opt.textContent = mhz + ' МГц';
+    selectEl.appendChild(opt);
+  });
+}
+
+// Вызывается при выборе значения в <select> частоты - аналогично setTxPower() выше, POST
+// /api/setCpuFreq (см. handleApiSetCpuFreq() в hub.ino). Сама смена частоты происходит НА
+// САМОМ ХАБЕ мгновенно (без перезагрузки), но сервер может ответить ошибкой (500), если
+// ядро отказалось от переключения - refreshStatus() в любом случае подтянет ФАКТИЧЕСКУЮ
+// текущую частоту от Хаба и вернёт select к прежнему значению.
+async function setCpuFreq(selectEl) {
+  try {
+    await fetch('/api/setCpuFreq', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'value=' + selectEl.value
+    });
+  } catch (e) {
+    console.error('Не удалось изменить частоту процессора', e);
+  }
+  refreshStatus();
 }
 
 syncTime();

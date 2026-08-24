@@ -10,8 +10,10 @@
                              // верхняя граница для configuredValveCount, А НЕ текущее рабочее значение -
                              // то теперь конфигурируется с Хаба и хранится в EEPROM, см. ниже.
 
-// Датчик потока (сам датчик ещё не опрошит, см. TODO у fillTelemetry() ниже) - ОБА параметра
-// ТЕПЕРЬ КОНФИГУРИРУЕМЫЕ с Хаба (см. configuredHasFlowSensor/configuredFlowPulsesPerLiter ниже), а НЕ
+// Датчик потока - САМ опрос (через прерывание на FLOW_SENSOR_PIN, см. ниже) уже реализован,
+// но реального датчика пока нет в руках - вместо него временно работает программная
+// эмуляция (FLOW_SENSOR_EMULATE, см. ниже). ОБА параметра ниже ТЕПЕРЬ КОНФИГУРИРУЕМЫЕ
+// с Хаба (см. configuredHasFlowSensor/configuredFlowPulsesPerLiter ниже), а НЕ
 // компиляционные константы - одна и та же прошивка может стоять на плате и с датчиком, и без него.
 // Значения ниже - ТОЛЬКО стартовые дефолты до первого MSG_SET_CONFIG от Хаба (или если в EEPROM ещё
 // ничего не сохранено - самая первая прошивка платы, см. loadConfig() ниже): датчик по умолчанию считается
@@ -32,6 +34,23 @@
 // именно этих GPIO - см. PROTOCOL.md §6.1.
 const uint8_t valvePins[MAX_VALVES] = {5, 4, 14, 12};
 
+// Вход датчика потока (импульсный, типа геркона датчика Холла) - ВЫБРАН 13-й GPIO,
+// потому что он поддерживает аппаратное прерывание на ESP8266 (в отличие, например,
+// от GPIO16) и не пересекается с valvePins выше/STATUS_LED ниже и загрузочными пинами
+// ESP8266 (GPIO0/2/15/16). На NodeMCU/Wemos D1 mini обозначается как D7.
+#define FLOW_SENSOR_PIN 13
+
+// FLOW_SENSOR_EMULATE=1 - РЕАЛЬНОГО датчика пока физически нет: вместо чтения
+// FLOW_SENSOR_PIN узел САМ программно генерирует импульсы, как будто вода текла через
+// открытый клапан с заданным для него расходом (см. emulatedFlowMlPerMin[] и
+// updateFlowEmulation() ниже) - удобно проверить весь путь "импульсы -> л/мин ->
+// накопленный объём -> телеметрия -> Хаб -> веб-интерфейс" ещё до того, как датчик
+// появится в руках. ВАЖНО: вся дальнейшая обработка импульсов (processFlowPulses()
+// ниже) ОДИНАКОВА в обоих режимах - она не знает и не должна знать, откуда взялся
+// очередной импульс в общем счётчике flowPulseCount ниже - поэтому переключение на
+// реальный датчик позже сводится к переключению этого одного флага в 0.
+#define FLOW_SENSOR_EMULATE 1
+
 #define WATCHDOG_TIMEOUT_MS 300000UL
 #define TELEMETRY_INTERVAL_MS 10000UL
 #define TELEMETRY_JITTER_MS 2000UL
@@ -49,14 +68,146 @@ uint8_t activeValvesMask = 0; // БИТОВАЯ МАСКА: бит (i) = кла�
                                // может быть установлено несколько битов сразу. См. IrrigationTelemetry.active_valves
                                // в GardenProtocol.h.
 
-// --- Конфигурация, задаваемая Хабом (MSG_SET_CONFIG) и хранимая на самом
-// узле в EEPROM - переживает перезагрузку, в отличие от activeValvesMask выше. До первого
-// успешного loadConfig() (или пока в EEPROM ещё ничего не записано, самая первая
-// прошивка платы) действуют значения по умолчанию ниже - MAX_VALVES каналов, режим 1.
+// --- Конфигурация, задаваемая Хабом (MSG_SET_CONFIG) - объявлена ЗДЕСЬ, выше блока
+// датчика потока ниже (вместо своего обычного места рядом с saveConfig()/loadConfig() ниже),
+// потому что updateFlowEmulation()/processFlowPulses() читают configuredHasFlowSensor/
+// configuredFlowPulsesPerLiter, а в C++ глобальная переменная должна быть объявлена ВЫШЕ
+// места использования (в отличие от функций, для которых Arduino IDE сама генерирует
+// прототипы). До первого успешного loadConfig() (или пока в EEPROM ещё ничего не
+// записано, самая первая прошивка платы) действуют значения по умолчанию ниже.
 uint8_t configuredValveCount = MAX_VALVES;
 uint8_t configuredMode = 1;
 uint8_t configuredHasFlowSensor = DEFAULT_HAS_FLOW_SENSOR;
 uint16_t configuredFlowPulsesPerLiter = DEFAULT_FLOW_PULSES_PER_LITER;
+
+// --- Датчик потока: общий счётчик импульсов и его источники ---
+
+// Сырой накапливающийся счётчик импульсов с момента включения - НИКОГДА не обнуляется,
+// processFlowPulses() ниже сам следит за разницей с предыдущим чтением. Пишется из ISR
+// (FLOW_SENSOR_EMULATE=0) или из loop() через updateFlowEmulation() (FLOW_SENSOR_EMULATE=1) -
+// в обоих случаях чтение из processFlowPulses() должно быть атомарным (см. там noInterrupts()/
+// interrupts()) - отсюда volatile.
+volatile uint32_t flowPulseCount = 0;
+
+#if !FLOW_SENSOR_EMULATE
+// ISR реального датчика - ОБЯЗАНА быть IRAM_ATTR на ESP8266 (иначе крэш при отключённом
+// от flash-кэша контексте прерывания) и предельно короткой - никакого Serial, делений
+// и т.п. внутри, только инкремент - вся остальная обработка (перевод в литры/расход) - в
+// processFlowPulses() ниже, вне ISR.
+IRAM_ATTR void onFlowPulseISR() {
+    flowPulseCount++;
+}
+#endif
+
+#if FLOW_SENSOR_EMULATE
+// Целевой расход КАЖДОГО канала при эмуляции (мл/мин) - клапан 1 → 5 л/мин, клапан 2 →
+// 6 л/мин и т.д. (по требованию - у каждого канала свой разный расход). Индекс i
+// соответствует клапану (i+1), как и во всех остальных битовых масках проекта
+// (activeValvesMask и т.п.). Если MAX_VALVES выше когда-нибудь изменится - дополнить этот
+// массив до того же размера. Используется ТОЛЬКО при FLOW_SENSOR_EMULATE=1.
+const uint32_t emulatedFlowMlPerMin[MAX_VALVES] = {5000, 6000, 7000, 8000};
+
+uint32_t lastEmulationMs = 0;   // millis() последнего вызова updateFlowEmulation()
+double emulatedMlAccum = 0.0;   // накопленные, но ещё не конвертированные в целый импульс "мл" -
+                                 // без этого остатка при частых вызовах loop() дробная часть мл каждый раз
+                                 // отбрасывалась бы округлением, и реальный воспроизводимый расход выше
+                                 // был бы занижен, чем задано.
+
+// Вызывается каждую итерацию loop() (НЕ раз в TELEMETRY_INTERVAL_MS - иначе при открытии
+// клапана прямо перед плановой телеметрией мы бы "проспали" почти весь интервал накопления
+// импульсов и получили бы резкий скачок вместо плавного счёта). Считает суммарный целевой
+// расход по всем открытым СЕЙЧАС клапанам (emulatedFlowMlPerMin[]) и генерирует ровно
+// столько импульсов, сколько реальный датчик с разрешением configuredFlowPulsesPerLiter
+// сгенерировал бы за прошедшее время при таком расходе - т.е. эмуляция "знает" истинный
+// физический расход в мл/мин, а не подделывает частоту импульсов напрямую - поэтому смена
+// configuredFlowPulsesPerLiter (даже через Хаб на лету) не меняет воспроизводимый расход, только
+// частоту импульсов.
+void updateFlowEmulation() {
+    uint32_t now = millis();
+    uint32_t elapsedMs = now - lastEmulationMs; // корректно и при переполнении millis()
+    lastEmulationMs = now;
+    if (elapsedMs == 0) return;
+
+    if (!configuredHasFlowSensor || activeValvesMask == 0) {
+        // Датчика "нет" по конфигурации или всё закрыто - реальных импульсов быть не
+        // должно - сбрасываем накопленную дробную часть, чтобы при следующем открытии клапана не
+        // начать с неё же (из-за простоя в закрытом состоянии она всё равно равна 0).
+        emulatedMlAccum = 0.0;
+        return;
+    }
+
+    uint32_t totalMlPerMin = 0;
+    for (uint8_t i = 0; i < MAX_VALVES; i++) {
+        if (activeValvesMask & (1 << i)) totalMlPerMin += emulatedFlowMlPerMin[i];
+    }
+
+    emulatedMlAccum += (double) totalMlPerMin * elapsedMs / 60000.0;
+    // Сколько ЦЕЛЫХ импульсов соответствует накопленным мл при ТЕКУЩЕМ разрешении - остаток
+    // (дробные мл) остаётся в emulatedMlAccum до следующего вызова.
+    uint32_t pulses = (uint32_t) (emulatedMlAccum * configuredFlowPulsesPerLiter / 1000.0);
+    if (pulses > 0) {
+        flowPulseCount += pulses;
+        emulatedMlAccum -= (double) pulses * 1000.0 / configuredFlowPulsesPerLiter;
+    }
+}
+#endif
+
+// Частота опроса счётчика импульсов (processFlowPulses() ниже) - НЕ привязана к
+// TELEMETRY_INTERVAL_MS, чтобы current_flow оставался свежим даже между отправками телеметрии
+// (а не только в момент её сборки) - и чтобы окно усреднения было достаточно широким для
+// точности при небольших configuredFlowPulsesPerLiter.
+#define FLOW_PROCESS_INTERVAL_MS 1000UL
+
+uint32_t lastFlowProcessMs = 0;        // millis() последней обработки импульсов
+uint32_t lastProcessedPulseCount = 0;  // значение flowPulseCount на момент предыдущей обработки
+uint32_t totalWaterUsedMl = 0;         // накоплено с момента включения, в мл (точнее, чем хранить сразу
+                                        // в целых литрах - в литры для IrrigationTelemetry.total_water_used
+                                        // конвертируется только в fillTelemetry())
+uint32_t currentFlowMlPerMin = 0;      // последний вычисленный мгновенный расход - читается из
+                                        // fillTelemetry(), пишется только здесь, в processFlowPulses()
+
+// Общая обработка накопленных импульсов - ОДИНАКОВА для реального датчика и эмуляции:
+// оба источника пишут в один и тот же flowPulseCount выше, а эта функция лишь читает его -
+// переключение на реальный датчик (FLOW_SENSOR_EMULATE=0) её не затрагивает.
+void processFlowPulses() {
+    uint32_t now = millis();
+    if (now - lastFlowProcessMs < FLOW_PROCESS_INTERVAL_MS) return;
+    uint32_t elapsedMs = now - lastFlowProcessMs;
+    lastFlowProcessMs = now;
+
+    // Атомарное чтение - flowPulseCount могут менять ISR (FLOW_SENSOR_EMULATE=0) в любой
+    // момент - без отключения прерываний чтение 32-битного значения на 8-битной AVR-подобной
+    // архитектуре было бы неатомарным (на ESP8266/32-бит это на самом деле и так атомарно, но
+    // явное noInterrupts()/interrupts() делает это не зависящим от платформы).
+    noInterrupts();
+    uint32_t pulsesNow = flowPulseCount;
+    interrupts();
+
+    uint32_t deltaPulses = pulsesNow - lastProcessedPulseCount; // корректно и при переполнении uint32_t
+    lastProcessedPulseCount = pulsesNow;
+
+    if (!configuredHasFlowSensor) {
+        // Датчика по конфигурации "нет" - даже если на входе случайные наведённые импульсы
+        // (плавающий неподключённый вход при FLOW_SENSOR_EMULATE=0), не трактуем их как расход -
+        // текущий расход считаем нулевым, накопленный объём не трогаем.
+        currentFlowMlPerMin = 0;
+        return;
+    }
+
+    if (deltaPulses > 0 && configuredFlowPulsesPerLiter > 0) {
+        uint32_t deltaMl = (uint32_t) ((uint64_t) deltaPulses * 1000UL / configuredFlowPulsesPerLiter);
+        totalWaterUsedMl += deltaMl;
+        currentFlowMlPerMin = (uint32_t) ((uint64_t) deltaMl * 60000UL / elapsedMs);
+    } else {
+        currentFlowMlPerMin = 0; // импульсов за этот интервал не было - расход сейчас нулевой
+    }
+}
+
+// --- Конфигурация, задаваемая Хабом (MSG_SET_CONFIG) и хранимая на самом
+// узле в EEPROM - переживает перезагрузку, в отличие от activeValvesMask выше.
+// Сами переменные configuredValveCount/configuredMode/configuredHasFlowSensor/
+// configuredFlowPulsesPerLiter объявлены ВЫШЕ (рядом с activeValvesMask, до блока датчика
+// потока) - см. комментарий там почему.
 
 // Метка "конфигурация в EEPROM записана осмысленно" - отличает "узел уже
 // настраивали" от "EEPROM только что стёрт/чип новый" (обычно там 0xFF или мусор) -
@@ -144,8 +295,10 @@ void fillConfig(UniversalPacket &pkt) {
 
 void fillTelemetry(UniversalPacket &pkt) {
     pkt.payload.irrigation.telemetry.active_valves = activeValvesMask;
-    pkt.payload.irrigation.telemetry.current_flow = 0;      // TODO: датчик потока
-    pkt.payload.irrigation.telemetry.total_water_used = 0;  // TODO: накопление + EEPROM
+    // Оба поля - из processFlowPulses() выше (вызывается из loop() независимо от телеметрии,
+    // см. там) - уже учитывают configuredHasFlowSensor сами (оба занулены, если датчика "нет").
+    pkt.payload.irrigation.telemetry.current_flow = currentFlowMlPerMin;
+    pkt.payload.irrigation.telemetry.total_water_used = totalWaterUsedMl / 1000UL;
 }
 
 uint8_t onCommand(const UniversalPacket &pkt) {
@@ -310,6 +463,16 @@ void setup() {
     for (uint8_t i = 0; i < MAX_VALVES; i++) pinMode(valvePins[i], OUTPUT);
     applyValveState(0);
 
+#if !FLOW_SENSOR_EMULATE
+    // INPUT_PULLUP - геркон/открытый коллектор типичного импульсного датчика Холла (например,
+    // YF-S201) в паузах между импульсами оставляет линию "в воздухе" - без подтяжки она была бы
+    // плавать и давать ложные срабатывания FALLING. Компилируется ТОЛЬКО при выключенной
+    // эмуляции (см. FLOW_SENSOR_EMULATE в начале файла) - чтобы не держать вход в
+    // неопределённом состоянии, пока реальный датчик не подключён.
+    pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), onFlowPulseISR, FALLING);
+#endif
+
     pinMode(STATUS_LED, OUTPUT);
     digitalWrite(STATUS_LED, HIGH);
 
@@ -338,4 +501,8 @@ void setup() {
 
 void loop() {
     node.loop();
+#if FLOW_SENSOR_EMULATE
+    updateFlowEmulation(); // каждую итерацию - пишет в flowPulseCount, см. комментарий там
+#endif
+    processFlowPulses(); // сам себя троттлит до FLOW_PROCESS_INTERVAL_MS, можно звать каждую итерацию
 }
