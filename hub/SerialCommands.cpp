@@ -1,16 +1,23 @@
 #include "SerialCommands.h"
 #include "DeviceManager.h"
+#include <WiFi.h>
 
 // Глобальные объекты/функции живут в hub.ino - это отдельная единица
 // трансляции (в отличие от .ino-файлов, .cpp-файлы не склеиваются Arduino
 // IDE в один файл автоматически), поэтому доступ к ним - через extern.
 extern DeviceManager deviceManager;
 extern bool timeSynced;
+extern bool apEnabled; // состояние точки доступа - для команды status ниже
 extern String currentTimeString();
 extern void sendCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uint8_t mode,
                          uint16_t durationSec, uint16_t volumeL);
 extern void sendSetConfig(int deviceIdx, uint8_t valveCount, uint8_t mode, uint8_t hasFlowSensor, uint16_t pulsesPerLiter);
 
+// Список доступных команд - одна строка на команду, вынесена в отдельную
+// функцию printHelp(), чтобы один и тот же текст использовался и по явной команде
+// "help", и при нераспознанной команде (вместо двух расходящихся копий этого же
+// текста, как было раньше).
+//
 //   list                          - показать известные устройства
 //   open <idx> <valve> <sec>      - открыть клапан на N секунд (mode=0). В режиме 1 (эксклюзивный)
 //                                    автоматически закроет другие клапаны этого устройства, в режиме 2
@@ -28,6 +35,25 @@ extern void sendSetConfig(int deviceIdx, uint8_t valveCount, uint8_t mode, uint8
 //   forget <idx>                  - удалить устройство (установленное или нет) из таблицы и NVS
 //   rename <idx> <name>           - переименовать установленное устройство, сохранить в NVS
 //   time                          - показать текущее время Хаба и статус синхронизации
+//   status                        - показать частоту процессора, мощность передатчика, число
+//                                    установленных устройств и состояние точки доступа
+//   help                          - показать этот список команд
+void printHelp() {
+    Serial.println("Доступные команды:");
+    Serial.println("  list                          - показать известные устройства");
+    Serial.println("  open <idx> <valve> <sec>      - открыть клапан на N секунд");
+    Serial.println("  volume <idx> <valve> <liters> - открыть клапан на N литров");
+    Serial.println("  close <idx> [valve]           - закрыть клапан (все, если valve не указан)");
+    Serial.println("  config <idx> <valves> <mode> <hasFlowSensor> <pulsesPerLiter>");
+    Serial.println("                                 - задать конфигурацию устройства (сохраняется на узле)");
+    Serial.println("  install <idx>                 - подтвердить устройство, защитить от вытеснения");
+    Serial.println("  forget <idx>                  - удалить устройство из таблицы и NVS");
+    Serial.println("  rename <idx> <name>           - переименовать установленное устройство");
+    Serial.println("  time                          - показать текущее время Хаба и статус синхронизации");
+    Serial.println("  status                        - показать частоту CPU, мощность передатчика, число");
+    Serial.println("                                   установленных устройств и состояние точки доступа");
+    Serial.println("  help                          - показать этот список команд");
+}
 void handleSerialCommand(String line) {
     line.trim();
     if (line.length() == 0) return;
@@ -122,9 +148,27 @@ void handleSerialCommand(String line) {
             Serial.println("Время Хаба ещё НЕ синхронизировано - ждём загрузки веб-страницы "
                             "в браузере или обнаружения часов DS3231 (см. PROTOCOL.md §12).");
         }
+    } else if (cmd == "status") {
+        // Считаем установленные устройства прямо здесь (а не через отдельный метод
+        // DeviceManager) - поле devices[] публичное именно для таких разовых частых
+        // чтений отдельных полей (см. большой комментарий в DeviceManager.h), заводить
+        // геттер под одно такое обращение избыточно.
+        int installedCount = 0;
+        for (int i = 0; i < MAX_DEVICES; i++) {
+            if (deviceManager.devices[i] != nullptr && deviceManager.devices[i]->installed) installedCount++;
+        }
+        // WiFi.getTxPower() возвращает wifi_power_t (сырое число в четвертях дБм, см.
+        // TX_POWER_OPTIONS/большой комментарий в hub.ino) - здесь просто делим на 4 для
+        // читаемого вывода, отдельная функция форматирования под Serial не заводилась.
+        Serial.println("--- Статус Хаба ---");
+        Serial.printf("Частота процессора: %u МГц\n", (unsigned) getCpuFrequencyMhz());
+        Serial.printf("Мощность передатчика: %.2f dBm\n", WiFi.getTxPower() / 4.0);
+        Serial.printf("Установлено устройств: %d\n", installedCount);
+        Serial.printf("Точка доступа: %s\n", apEnabled ? "ВКЛЮЧЕНА" : "ВЫКЛЮЧЕНА");
+        Serial.println("-------------------");
+    } else if (cmd == "help") {
+        printHelp();
     } else {
-        Serial.println("Команды: list | open <idx> <valve> <sec> | volume <idx> <valve> <liters> | "
-                        "close <idx> [valve] | config <idx> <valves> <mode> <hasFlowSensor> <pulsesPerLiter> | "
-                        "install <idx> | forget <idx> | rename <idx> <name> | time");
+        Serial.println("Неизвестная команда. Введите 'help' для списка доступных команд.");
     }
 }

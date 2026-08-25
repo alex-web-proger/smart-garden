@@ -130,11 +130,16 @@ const char *AP_PASSWORD = "garden123";
 // пригодиться для соблюдения регуляторных ограничений или снижения взаимных помех между
 // несколькими изделиями в помещении.
 //
-// Не сохраняется в NVS намеренно (как и apEnabled выше) - каждый сброс Хаба
-// возвращает максимальную мощность (дефолт самого Wi-Fi-драйвера после
-// WiFi.mode()) - это безопасный дефолт для связи с узлами (отличие от точки
-// доступа - меньшая мощность не создаёт такой поверхности атаки, как
-// включённая по умолчанию точка доступа - поэтому персистировать её не требовалось).
+// Сохраняется в NVS (см. saveTxPowerToNVS()/loadRadioSettingsFromNVS() ниже) -
+// в отличие от apEnabled выше, здесь персистентность как раз то, что нужно:
+// точку доступа безопаснее каждый раз включать заново явным действием оператора,
+// а вот выбранную для конкретного изделия мощность передатчика, наоборот, удобнее
+// применять автоматически при каждом старте, не заставляя оператора выставлять её
+// заново после любого сброса/перебоя питания. При старте (см. loadRadioSettingsFromNVS(),
+// вызывается из setup()) восстановленное значение всё равно сверяется С НАБОРОМ
+// TX_POWER_OPTIONS ниже - та же защита, что и в handleApiSetTxPower() - если в NVS
+// вдруг окажется значение вне этого набора (повреждение/старая прошивка с другим
+// набором опций), оно молча игнорируется и остаётся дефолт ядра.
 struct TxPowerOption {
     wifi_power_t value;
     const char *label; // для Serial-лога и как подсказка при отладке - веб-страница сама
@@ -166,10 +171,23 @@ const TxPowerOption TX_POWER_OPTIONS[] = {
 // (или вовсе не применяются - setCpuFrequencyMhz() вернёт false, см. handleApiSetCpuFreq() ниже) -
 // восстановить связь в таком случае может потребовать физического сброса Хаба на месте -
 // поэтому в список выбора на веб-странице (см. WebPage.h) сознательно не включаются ниже 80 МГц.
-// То же самое, что и с TX_POWER_OPTIONS выше: не сохраняется в NVS - каждый сброс Хаба возвращает
-// максимальную частоту (дефолт ядра после загрузки) - безопасный дефолт.
+// Как и TX_POWER_OPTIONS выше, теперь сохраняется в NVS и восстанавливается при каждом
+// старте (см. saveCpuFreqToNVS()/loadRadioSettingsFromNVS() ниже) - с той же защитой:
+// восстановленное значение сверяется С НАБОРОМ CPU_FREQ_OPTIONS ниже, а не применяется
+// как сырое число из NVS, поэтому повреждённое/чужое значение там не может заставить
+// ядро попытаться выставить что-то за пределами заведомо проверенных 240/160/80 МГц.
 const uint32_t CPU_FREQ_OPTIONS[] = {240, 160, 80};
 #define CPU_FREQ_OPTIONS_COUNT (sizeof(CPU_FREQ_OPTIONS) / sizeof(CPU_FREQ_OPTIONS[0]))
+
+// NVS-namespace/ключи для мощности передатчика и частоты процессора - тот же
+// namespace ("smartgarden"), что и у DeviceManager (см. DeviceManager.cpp,
+// NVS_NAMESPACE) - конфликта нет, т.к. ключи разные ("installed" против
+// "txpower"/"cpufreq"), а отдельный namespace ради двух дополнительных целых
+// чисел не оправдан. См. saveTxPowerToNVS()/saveCpuFreqToNVS()/
+// loadRadioSettingsFromNVS() ниже.
+const char *RADIO_NVS_NAMESPACE = "smartgarden";
+const char *NVS_KEY_TX_POWER = "txpower";
+const char *NVS_KEY_CPU_FREQ = "cpufreq";
 
 // Имя хоста для mDNS (протокол "Bonjour"/"zeroconf", в Linux обычно
 // реализован через avahi) - см. большой комментарий про домен в начале
@@ -799,11 +817,93 @@ void handleApiStatus() {
     server.send(200, "application/json", json);
 }
 
+// Сохраняет текущую мощность передатчика в NVS - вызывается из handleApiSetTxPower()
+// после успешного применения значения - чтобы оно пережило перезагрузку Хаба
+// (см. loadRadioSettingsFromNVS() ниже, вызывается из setup()). Отдельная функция,
+// а не putInt() прямо внутри handleApiSetTxPower() - чтобы та же логика была доступна
+// и для возможных будущих вызовов (например, из Serial-команд, если они когда-нибудь
+// появятся для этих настроек).
+void saveTxPowerToNVS(wifi_power_t value) {
+    Preferences prefs;
+    prefs.begin(RADIO_NVS_NAMESPACE, false);
+    prefs.putInt(NVS_KEY_TX_POWER, (int) value);
+    prefs.end();
+}
+
+// Симметрично saveTxPowerToNVS() выше - для частоты процессора.
+void saveCpuFreqToNVS(uint32_t value) {
+    Preferences prefs;
+    prefs.begin(RADIO_NVS_NAMESPACE, false);
+    prefs.putUInt(NVS_KEY_CPU_FREQ, value);
+    prefs.end();
+}
+
+// Восстанавливает мощность передатчика и частоту процессора из NVS - вызывается один
+// раз из setup(), после WiFi.mode(WIFI_AP_STA) (без этого WiFi.setTxPower() не
+// имеет смысла - радио ещё не инициализировано), чтобы Хаб сразу работал
+// с настройками, которые оператор выбрал в прошлый раз, а не с дефолтами ядра.
+// Каждое восстановленное значение сверяется С НАБОРОМ допустимых значений
+// (TX_POWER_OPTIONS/CPU_FREQ_OPTIONS) - той же проверкой, что и в
+// handleApiSetTxPower()/handleApiSetCpuFreq() - если в NVS вдруг оказалось значение
+// вне этого набора (повреждение, старая прошивка с другим набором опций),
+// оно молча игнорируется, и остаётся дефолт ядра, а НЕ падаем и НЕ применяем
+// недоверенное сырое число.
+//
+// Частота процессора ниже 240 МГц может временно замедлить радио/веб-интерфейс
+// на первых итерациях после сброса, но это ожидаемое поведение самой пониженной
+// частоты (см. комментарий у CPU_FREQ_OPTIONS выше) - оператор, сохранивший такое
+// значение через веб-интерфейс, уже явно согласился на этот компромисс.
+void loadRadioSettingsFromNVS() {
+    Preferences prefs;
+    prefs.begin(RADIO_NVS_NAMESPACE, true); // read-only
+    bool hasTxPower = prefs.isKey(NVS_KEY_TX_POWER);
+    int savedTxPower = hasTxPower ? prefs.getInt(NVS_KEY_TX_POWER) : 0;
+    bool hasCpuFreq = prefs.isKey(NVS_KEY_CPU_FREQ);
+    uint32_t savedCpuFreq = hasCpuFreq ? prefs.getUInt(NVS_KEY_CPU_FREQ) : 0;
+    prefs.end();
+
+    if (hasTxPower) {
+        bool applied = false;
+        for (size_t i = 0; i < TX_POWER_OPTIONS_COUNT; i++) {
+            if ((int) TX_POWER_OPTIONS[i].value == savedTxPower) {
+                WiFi.setTxPower(TX_POWER_OPTIONS[i].value);
+                Serial.printf("Мощность передатчика восстановлена из NVS: %s\n", TX_POWER_OPTIONS[i].label);
+                applied = true;
+                break;
+            }
+        }
+        if (!applied) {
+            Serial.println("Сохранённая в NVS мощность передатчика не входит в допустимый набор - игнорирую, оставляю дефолт.");
+        }
+    }
+
+    if (hasCpuFreq) {
+        bool applied = false;
+        for (size_t i = 0; i < CPU_FREQ_OPTIONS_COUNT; i++) {
+            if (CPU_FREQ_OPTIONS[i] == savedCpuFreq) {
+                bool ok = setCpuFrequencyMhz(CPU_FREQ_OPTIONS[i]);
+                if (ok) {
+                    Serial.printf("Частота процессора восстановлена из NVS: %u МГц\n", (unsigned) CPU_FREQ_OPTIONS[i]);
+                } else {
+                    Serial.printf("Не удалось восстановить частоту процессора %u МГц из NVS (отклонено ядром) - оставляю дефолт.\n",
+                                  (unsigned) CPU_FREQ_OPTIONS[i]);
+                }
+                applied = true;
+                break;
+            }
+        }
+        if (!applied) {
+            Serial.println("Сохранённая в NVS частота процессора не входит в допустимый набор - игнорирую, оставляю дефолт.");
+        }
+    }
+}
+
 // POST /api/setTxPower - form-urlencoded: value (целое число в четвертях дБм, то есть сырое значение
 // wifi_power_t - см. TX_POWER_OPTIONS выше). Обязательно сверяется С НАБОРОМ допустимых
 // значений, а НЕ с диапазоном чисел - см. комментарий у TX_POWER_OPTIONS выше, почему это
-// важно. Влияет СРАЗУ (без перезагрузки радио) и НЕ сохраняется между
-// перезагрузками (см. комментарий у TX_POWER_OPTIONS выше).
+// важно. Влияет СРАЗУ (без перезагрузки радио) и СОХРАНЯЕТСЯ в NVS (см.
+// saveTxPowerToNVS() выше), поэтому переживёт следующий сброс Хаба (см.
+// loadRadioSettingsFromNVS(), вызывается из setup()).
 void handleApiSetTxPower() {
     if (!server.hasArg("value")) {
         server.send(400, "text/plain", "missing value");
@@ -813,6 +913,7 @@ void handleApiSetTxPower() {
     for (size_t i = 0; i < TX_POWER_OPTIONS_COUNT; i++) {
         if ((int) TX_POWER_OPTIONS[i].value == requested) {
             WiFi.setTxPower(TX_POWER_OPTIONS[i].value);
+            saveTxPowerToNVS(TX_POWER_OPTIONS[i].value);
             Serial.printf("Мощность передатчика установлена: %s\n", TX_POWER_OPTIONS[i].label);
             server.send(200, "text/plain", "ok");
             return;
@@ -824,7 +925,12 @@ void handleApiSetTxPower() {
 // POST /api/setCpuFreq - form-urlencoded: value (целое число в МГц, см. CPU_FREQ_OPTIONS выше).
 // Сверяется С НАБОРОМ допустимых значений - та же логика, что и у handleApiSetTxPower() выше.
 // setCpuFrequencyMhz() возвращает bool - может отказаться (неверный делитель для текущего
-// источника тактовой частоты), проверяем его и отвечаем честно, а не всегда "ok".
+// источника тактовой частоты), проверяем его и отвечаем честно, а не всегда "ok". При
+// успехе также СОХРАНЯЕТ выбор в NVS (см. saveCpuFreqToNVS() выше), по той же причине,
+// что и handleApiSetTxPower() - чтобы выбор пережил следующий сброс Хаба. На отказе ядра
+// (ok == false) в NVS НИЧЕГО не пишется - сохранять имеет смысл только то, что реально
+// применилось к живому радио, иначе при следующем старте loadRadioSettingsFromNVS()
+// попыталась бы вновь выставить то же заведомо отклонённое ядром значение.
 void handleApiSetCpuFreq() {
     if (!server.hasArg("value")) {
         server.send(400, "text/plain", "missing value");
@@ -835,6 +941,7 @@ void handleApiSetCpuFreq() {
         if ((int) CPU_FREQ_OPTIONS[i] == requested) {
             bool ok = setCpuFrequencyMhz(CPU_FREQ_OPTIONS[i]);
             if (ok) {
+                saveCpuFreqToNVS(CPU_FREQ_OPTIONS[i]);
                 Serial.printf("Частота процессора установлена: %u МГц\n", (unsigned) CPU_FREQ_OPTIONS[i]);
                 server.send(200, "text/plain", "ok");
             } else {
@@ -892,6 +999,13 @@ void setup() {
     WiFi.mode(WIFI_AP_STA);
     esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
+    // Восстанавливаем мощность передатчика/частоту процессора из NVS СРАЗУ после
+    // WiFi.mode() (раньше WiFi.setTxPower() не сработает - радио ещё не инициализировано)
+    // и ДО esp_now_init()/точки доступа ниже - чтобы Хаб сразу начинал работу с
+    // настройками, выбранными оператором в прошлый раз (см. loadRadioSettingsFromNVS()
+    // выше и большой комментарий у TX_POWER_OPTIONS/CPU_FREQ_OPTIONS в начале файла).
+    loadRadioSettingsFromNVS();
+
     WiFi.macAddress(myMac);
     Serial.print("Hub MAC: ");
     Serial.println(WiFi.macAddress());
@@ -948,9 +1062,8 @@ void setup() {
     server.begin();
     Serial.println("Веб-сервер запущен.");
 
-    Serial.println("Serial-команды: list | open <idx> <valve> <sec> | volume <idx> <valve> <liters> | "
-                    "close <idx> [valve] | config <idx> <valves> <mode> <hasFlowSensor> <pulsesPerLiter> | "
-                    "install <idx> | forget <idx> | rename <idx> <name> | time");
+    Serial.println("Serial-команды: введите 'help' для списка доступных команд (list, open, volume, close, "
+                    "config, install, forget, rename, time, status, help).");
 
     // Объявляем о своей (пере)загрузке всем узлам сети - см. sendHubAnnounce().
     // Несколько повторов с паузой, а не один пакет, на случай потерь в эфире.

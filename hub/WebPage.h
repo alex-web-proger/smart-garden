@@ -32,11 +32,20 @@
 // перезагрузку) - см. GardenProtocol.h/PROTOCOL.md §3.2 и onSetConfig() в
 // flow_node.ino.
 //
-// САМ ХАБ (не узел): под строкой времени/uptime — температура кристалла ESP32, мощность
+// САМ ХАБ (не узел): температура кристалла ESP32, мощность
 // передатчика Wi-Fi/ESP-NOW и частота процессора, все три read+write через /api/status
 // (GET) и /api/setTxPower, /api/setCpuFreq (POST) — см. handleApiStatus()/
-// handleApiSetTxPower()/handleApiSetCpuFreq() в hub.ino. Ни то, ни другое НЕ сохраняется
-// между перезагрузками Хаба — оба возвращаются к безопасному максимуму при каждом сбросе.
+// handleApiSetTxPower()/handleApiSetCpuFreq() в hub.ino. Мощность передатчика и частота
+// процессора сохраняются в NVS и применяются автоматически при каждом сбросе Хаба (см.
+// loadRadioSettingsFromNVS() в hub.ino) — температура, разумеется, не настраивается и
+// нигде не сохраняется, это просто текущее показание датчика.
+// Температура показывается СРАЗУ в двух местах - короткой строкой на главной странице
+// (под "Время после сброса") и ещё раз в модальном окне "Настройки Хаба" - у каждой свой
+// DOM-id (temp-status/modal-temp-value), обновляются они одним refreshStatus() в скрипте.
+// Сама модалка открывается шестерёнкой рядом с заголовком страницы (см. openHubModal() в
+// скрипте) - мощность/частота настраиваются там же, простыми строками без
+// схлопывающихся секций и без поясняющих подписей - это редкие настройки, но, раз уж
+// оператор открыл модалку, лучше видеть их сразу целиком, без лишнего клика по каждой.
 //
 // НАЗВАНИЕ УСТРОЙСТВА: карточка показывает его вместо "Узел #idx", если
 // оно задано - редактируется в модальном окне (поле "Название" + кнопка
@@ -55,17 +64,25 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <title>Smart Garden — Хаб</title>
 <style>
   * { box-sizing: border-box; }
+  /* Глобальное увеличение шрифта в 1.15 раза - все остальные размеры в этом файле
+     заданы в em/% (не px), то есть каскадно отсчитываются от размера шрифта
+     родителя, а body font-size сам не задан явно и наследуется от html - поэтому
+     достаточно одной этой строки, чтобы пропорционально увеличить ВСЕ шрифты
+     страницы (и элементы, зависящие от em, вроде padding у кнопок) разом, вместо
+     правки каждого правила ниже по отдельности. */
+  html { font-size: 115%; }
   body { font-family: -apple-system, sans-serif; margin: 16px; background:#f6f6f2; color:#222; }
   h1 { font-size: 1.2em; margin-bottom: 4px; }
-  .sub { color:#777; font-size: 0.85em; margin-bottom: 14px; line-height:1.5; }
-  .legend-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin:0 3px -1px 0; }
-  #time-status { font-size: 0.85em; margin-bottom: 4px; }
-  .time-synced { color:#2a7d2a; }
-  .time-unsynced { color:#b8860b; }
+  /* Шестеренка открытия модалки "Настройки Хаба" прямо в заголовке (inline внутри <h1>,
+     не position:absolute, как у .gear-btn на карточке устройства - там нужен именно отступ
+     от края карточки, здесь же просто иконка рядом с текстом). */
+  .header-gear-btn { display:inline-flex; align-items:center; justify-content:center; vertical-align:middle;
+                      margin-left:8px; border:none; background:none; cursor:pointer; padding:0; box-shadow:none; }
+  .header-gear-btn svg { width:22px; height:22px; fill:#555; }
+  .header-gear-btn:active svg { fill:#222; }
   #uptime-status { font-size: 0.85em; margin-bottom: 4px; color:#666; }
-  #hub-radio-status { font-size: 0.85em; margin-bottom: 16px; color:#666; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
-  #hub-radio-status select { padding:2px 4px; border:1px solid #ccc; border-radius:4px; font-size:0.85em; }
-  #temp-value.temp-hot { color:#c0392b; font-weight:600; }
+  #temp-status { font-size: 0.85em; margin-bottom: 16px; color:#666; }
+  .temp-hot { color:#c0392b; font-weight:600; }
 
   .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
   .empty { padding: 30px; text-align:center; color:#999; background:#fff; border-radius:10px; }
@@ -104,10 +121,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
            max-height:90vh; overflow-y:auto; }
   .modal-header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:4px; gap:10px; }
   .modal-header h2 { margin:0; font-size:1.1em; }
-  .modal-close { border:none; background:none; font-size:22px; line-height:1; cursor:pointer; color:#888; padding:0 4px; }
+  .modal-close { border:none; background:none; font-size:1.375em; line-height:1; cursor:pointer; color:#888; padding:0 4px; }
 
   .modal-field { font-size:0.85em; margin-bottom:6px; color:#444; display:flex; justify-content:space-between; gap:10px; align-items:center; }
   .modal-field b { color:#222; font-weight:600; }
+  .modal-field select { padding:4px 6px; border:1px solid #ccc; border-radius:4px; font-size:0.85em; }
   .name-edit { display:flex; gap:6px; align-items:center; }
   .name-edit input { width:130px; padding:4px 6px; border:1px solid #ccc; border-radius:4px; font-size:0.85em; }
   .name-edit button { padding:4px 9px; font-size:0.9em; }
@@ -147,28 +165,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </style>
 </head>
 <body>
-<h1>Smart Garden — Хаб</h1>
-<div class="sub">
-  Автообновление каждые 2 сек. Нажмите ⚙ на карточке устройства для подробностей, управления и переименования.<br>
-  <span class="legend-dot" style="background:#3a8f2e"></span>Установлено —
-  <span class="legend-dot" style="background:#d8860a"></span>Кандидат, не установлено (нажмите ⚙, чтобы установить)
-</div>
-<div id="time-status" class="time-unsynced">Синхронизация времени...</div>
-<div id="uptime-status">Время работы: —</div>
-<!-- Температура кристалла и мощность передатчика САМОГО Хаба (не узла!) - см.
-     refreshStatus()/txPowerChanged() в скрипте. Список в <select> строится из TX_POWER_OPTIONS ниже —
-     тот же набор значений wifi_power_t, что и в hub.ino (TX_POWER_OPTIONS там) — дублируется вручную,
-     потому что это JS, а не C++, общего enum'а между ними нет (та же ситуация, что с ACTION_OPEN/
-     ACTION_CLOSE выше в valveButtonClick()). -->
-<div id="hub-radio-status">
-  <span>Температура Хаба: <b id="temp-value">—</b></span>
-  <span>Мощность передатчика:
-    <select id="tx-power-select" onchange="setTxPower(this)"></select>
-  </span>
-  <span>Частота процессора:
-    <select id="cpu-freq-select" onchange="setCpuFreq(this)"></select>
-  </span>
-</div>
+<h1>Smart Garden — Хаб
+  <button class="header-gear-btn" onclick="openHubModal()" title="Настройки Хаба">
+    <svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.63c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+  </button>
+</h1>
+<div id="uptime-status">Время после сброса: —</div>
+<div id="temp-status">Температура Хаба: —</div>
 
 <div class="grid" id="devices-grid"><div class="empty">Загрузка...</div></div>
 
@@ -215,6 +218,37 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </div>
 </div>
 
+<!-- Модальное окно с настройками САМОГО ХАБА (не узла!) - температура кристалла,
+     мощность передатчика Wi-Fi/ESP-NOW и частота процессора - отдельная от
+     модалки устройства выше (свой backdrop, свой openHubModal()/closeHubModal() в
+     скрипте) - открывается шестеренкой в заголовке страницы. Три простые строки
+     (.modal-field, тот же паттерн, что и у MAC/Связь/Статус в модалке устройства) - без
+     схлопывающихся секций и без поясняющих подписей - настройки редкие, но всегда видны
+     целиком сразу, без лишнего клика. Списки в <select> строятся из TX_POWER_OPTIONS/
+     CPU_FREQ_OPTIONS в скрипте - тот же набор значений, что и в hub.ino
+     (TX_POWER_OPTIONS/CPU_FREQ_OPTIONS там) - дублируется вручную, потому что это JS, а не C++,
+     общего enum'а между ними нет (та же ситуация, что с ACTION_OPEN/ACTION_CLOSE выше в
+     valveButtonClick()). Температура здесь - второй, отдельный от главной страницы, DOM-элемент
+     (id="modal-temp-value") - у главной страницы свой (id="temp-status"), оба обновляются
+     одним refreshStatus() независимо друг от друга (id не могут повторяться на странице). -->
+<div class="modal-backdrop" id="hub-modal-backdrop">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>Настройки Хаба</h2>
+      <button class="modal-close" onclick="closeHubModal()">×</button>
+    </div>
+    <div class="modal-field"><span>Температура Хаба</span><b id="modal-temp-value">—</b></div>
+    <div class="modal-field">
+      <span>Частота процессора</span>
+      <select id="cpu-freq-select" onchange="setCpuFreq(this)"></select>
+    </div>
+    <div class="modal-field">
+      <span>Мощность передатчика</span>
+      <select id="tx-power-select" onchange="setTxPower(this)"></select>
+    </div>
+  </div>
+</div>
+
 <script>
 // idx -> { el: <DOM-карточка>, installed: bool|null } - хранится между
 // вызовами refresh(), чтобы не пересоздавать DOM-узлы карточек на
@@ -234,6 +268,24 @@ let openModalIdx = null;
 // Для какого idx/valveCount построена секция клапанов+конфигурации - см.
 // комментарий у нужной пересборки ниже (updateModal()).
 let typeSpecificBuiltFor = null;
+
+// Аналог openModalIdx/closeModal() выше, но для модалки "Настройки Хаба" - там
+// нет своего idx (она одна на всю страницу, про сам Хаб, а не про конкретное
+// устройство), поэтому достаточно простого bool. Содержимое обновляется тем
+// же refreshStatus(), что и раньше, независимо от того, открыта модалка или нет (элементы
+// просто скрыты через display:none у затемнённого фона, это не мешает им обновляться в
+// фоне).
+let hubModalOpen = false;
+
+function openHubModal() {
+  hubModalOpen = true;
+  document.getElementById('hub-modal-backdrop').classList.add('open');
+}
+
+function closeHubModal() {
+  hubModalOpen = false;
+  document.getElementById('hub-modal-backdrop').classList.remove('open');
+}
 
 function connInfo(agoSec) {
   // Пороги ориентируются на типичный интервал телеметрии (см.
@@ -663,12 +715,18 @@ async function forgetDevice(idx, installed) {
 }
 
 // Закрытие модального окна по клику на затемнённый фон (не на саму
-// карточку модального окна) и по Escape - обычные ожидаемые способы.
+// карточку модального окна) и по Escape - обычные ожидаемые способы - для обеих
+// модалок (устройства и "Настройки Хаба").
 document.getElementById('modal-backdrop').addEventListener('click', (e) => {
   if (e.target.id === 'modal-backdrop') closeModal();
 });
+document.getElementById('hub-modal-backdrop').addEventListener('click', (e) => {
+  if (e.target.id === 'hub-modal-backdrop') closeHubModal();
+});
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && openModalIdx !== null) closeModal();
+  if (e.key !== 'Escape') return;
+  if (openModalIdx !== null) closeModal();
+  else if (hubModalOpen) closeHubModal();
 });
 
 // Хаб не имеет RTC-модуля с батарейкой - его часы (time()/settimeofday())
@@ -731,53 +789,79 @@ async function refreshStatus() {
   try {
     const res = await fetch('/api/status');
     const status = await res.json();
-    const el = document.getElementById('time-status');
-    if (status.timeSynced) {
-      el.textContent = 'Время Хаба: ' + status.timeString;
-      el.className = 'time-synced';
-    } else {
-      el.textContent = 'Время Хаба не синхронизировано (ожидание браузера)';
-      el.className = 'time-unsynced';
-    }
+
     const uptimeEl = document.getElementById('uptime-status');
     if (typeof status.uptimeSec === 'number') {
-      uptimeEl.textContent = 'Время работы с момента сброса: ' + formatUptime(status.uptimeSec);
+      uptimeEl.textContent = 'Время после сброса: ' + formatUptime(status.uptimeSec);
     }
 
     // Температура кристалла Самого Хаба (chipTempC из /api/status, см. temperatureRead() в
-    // handleApiStatus() в hub.ino) - подсвечиваем красным, если заметно горячее (порог чисто
-    // для визуального внимания, не аварийный порог - встроенный датчик ESP32 всё равно не
-    // точен, см. комментарий в hub.ino).
-    const tempEl = document.getElementById('temp-value');
+    // handleApiStatus() в hub.ino) - обновляется СРАЗУ ДВА элемента - одна строка на
+    // главной странице (#temp-status) и одна в модалке "Настройки Хаба"
+    // (#modal-temp-value) - id не могут повторяться на странице, поэтому два разных элемента.
+    // Красный цвет при заметно высокой температуре (порог чисто для визуального
+    // внимания, не аварийный порог - встроенный датчик ESP32 всё равно не
+    // точен, см. комментарий в hub.ino) - оба элемента подсвечиваются одинаково, через
+    // общий CSS-класс .temp-hot (не привязан к конкретному id, см. стили выше).
     if (typeof status.chipTempC === 'number') {
-      tempEl.textContent = status.chipTempC.toFixed(1) + ' °C';
-      tempEl.classList.toggle('temp-hot', status.chipTempC >= 75);
+      const tempText = status.chipTempC.toFixed(1) + ' °C';
+      const isHot = status.chipTempC >= 75;
+
+      const tempStatusEl = document.getElementById('temp-status');
+      tempStatusEl.textContent = 'Температура Хаба: ' + tempText;
+      tempStatusEl.classList.toggle('temp-hot', isHot);
+
+      const modalTempEl = document.getElementById('modal-temp-value');
+      modalTempEl.textContent = tempText;
+      modalTempEl.classList.toggle('temp-hot', isHot);
     }
 
     // Мощность передатчика (txPowerQuarterDbm из /api/status, сырое число в четвертях дБм,
     // точно то же, что возвращает WiFi.getTxPower() на Хабе) - список опций строится ОДИН
-    // РАЗ (populateTxPowerOptions() ниже), а дальше каждый тик просто ставится текущее значение -
-    // в отличие от секции конфигурации узла выше, здесь нет риска "самопроизвольного закрытия"
-    // выпадающего списка - мы НЕ пересобираем сам select (только меняем .value), а сами <option> уже
-    // в DOM одноразово.
+    // РАЗ (populateTxPowerOptions() ниже), а дальше каждый тик просто ставится текущее значение.
+    // В отличие от текстовых полей/секции конфигурации узла выше, ЗДЕСЬ НАРОЧНО НЕ
+    // проверяется document.activeElement: сама по себе установка .value у <select> НЕ закрывает
+    // открытый список и НЕ сбивает набор текста (как было бы с <input>) - а без этой синхронизации
+    // выбранное значение не подтверждалось/не подсвечивалось в списке, пока select оставался в фокусе
+    // (то есть практически всё время после выбора, если оператор не кликнул куда-то ещё) - именно
+    // это было багом.
     const txSelect = document.getElementById('tx-power-select');
     if (txSelect.options.length === 0) populateTxPowerOptions(txSelect);
-    if (typeof status.txPowerQuarterDbm === 'number' && document.activeElement !== txSelect) {
-      // document.activeElement !== txSelect - не перезатираем выбор пользователя, пока он именно
-      // сейчас открыт/в фокусе у этого select - та же логика, что и для полей ввода выше.
-      txSelect.value = String(status.txPowerQuarterDbm);
+    if (typeof status.txPowerQuarterDbm === 'number') {
+      setSelectValueEnsuringOption(txSelect, status.txPowerQuarterDbm, (v) => (v / 4) + ' дБм (нестандартно)');
     }
 
     // Частота процессора (cpuFreqMhz из /api/status, см. getCpuFrequencyMhz() в hub.ino) - то же
     // самое обращение, что и с мощностью передатчика выше - список один раз, значение каждый тик.
     const cpuSelect = document.getElementById('cpu-freq-select');
     if (cpuSelect.options.length === 0) populateCpuFreqOptions(cpuSelect);
-    if (typeof status.cpuFreqMhz === 'number' && document.activeElement !== cpuSelect) {
-      cpuSelect.value = String(status.cpuFreqMhz);
+    if (typeof status.cpuFreqMhz === 'number') {
+      setSelectValueEnsuringOption(cpuSelect, status.cpuFreqMhz, (v) => v + ' МГц (нестандартно)');
     }
   } catch (e) {
     console.error('Не удалось получить статус Хаба', e);
   }
+}
+
+// Ставит в select текущее значение с Хаба; если такого <option> ещё нет среди штатных
+// (например, если драйвер/регуляторные ограничения округлили/отклонили запрошенное
+// значение, и реально применённое число не совпало ни с одним из наших вариантов) -
+// добавляет недостающий <option> на лету, чтобы список ВСЕГДА показывал реальное текущее
+// значение, а не оставался пустым/невыбранным - именно это был симптом описанного
+// бага (выбранное значение не подсвечивалось в списке).
+function setSelectValueEnsuringOption(selectEl, value, formatFallbackLabel) {
+  const strValue = String(value);
+  let hasOption = false;
+  for (let i = 0; i < selectEl.options.length; i++) {
+    if (selectEl.options[i].value === strValue) { hasOption = true; break; }
+  }
+  if (!hasOption) {
+    const opt = document.createElement('option');
+    opt.value = strValue;
+    opt.textContent = formatFallbackLabel(value);
+    selectEl.appendChild(opt);
+  }
+  selectEl.value = strValue;
 }
 
 // Список допустимых значений мощности передатчика - должен точно совпадать с
