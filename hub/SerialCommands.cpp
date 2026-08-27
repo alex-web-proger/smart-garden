@@ -8,6 +8,9 @@
 extern DeviceManager deviceManager;
 extern bool timeSynced;
 extern bool apEnabled; // состояние точки доступа - для команды status ниже
+extern float tempTripC;    // порог аварийного отключения радио по перегреву (см. hub.ino) - для status ниже
+extern float tempRecoverC; // порог восстановления после него - там же
+extern bool radioOverheatShutdown; // действует ли сейчас отключение по перегреву - там же
 extern String currentTimeString();
 extern void sendCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uint8_t mode,
                          uint16_t durationSec, uint16_t volumeL);
@@ -36,7 +39,8 @@ extern void sendSetConfig(int deviceIdx, uint8_t valveCount, uint8_t mode, uint8
 //   rename <idx> <name>           - переименовать установленное устройство, сохранить в NVS
 //   time                          - показать текущее время Хаба и статус синхронизации
 //   status                        - показать частоту процессора, мощность передатчика, число
-//                                    установленных устройств и состояние точки доступа
+//                                    установленных устройств, состояние точки доступа и пороги
+//                                    защиты от перегрева (вместе с текущим состоянием защиты)
 //   help                          - показать этот список команд
 void printHelp() {
     Serial.println("Доступные команды:");
@@ -51,7 +55,7 @@ void printHelp() {
     Serial.println("  rename <idx> <name>           - переименовать установленное устройство");
     Serial.println("  time                          - показать текущее время Хаба и статус синхронизации");
     Serial.println("  status                        - показать частоту CPU, мощность передатчика, число");
-    Serial.println("                                   установленных устройств и состояние точки доступа");
+    Serial.println("                                   установленных устройств, точку доступа и пороги перегрева");
     Serial.println("  help                          - показать этот список команд");
 }
 void handleSerialCommand(String line) {
@@ -165,6 +169,10 @@ void handleSerialCommand(String line) {
         Serial.printf("Мощность передатчика: %.2f dBm\n", WiFi.getTxPower() / 4.0);
         Serial.printf("Установлено устройств: %d\n", installedCount);
         Serial.printf("Точка доступа: %s\n", apEnabled ? "ВКЛЮЧЕНА" : "ВЫКЛЮЧЕНА");
+        Serial.printf("Порог аварийного отключения (перегрев): %.1f °C\n", tempTripC);
+        Serial.printf("Порог восстановления после перегрева: %.1f °C\n", tempRecoverC);
+        Serial.printf("Радиосвязь (ESP-NOW): %s\n",
+                      radioOverheatShutdown ? "ОТКЛЮЧЕНА (перегрев)" : "работает");
         Serial.println("-------------------");
     } else if (cmd == "help") {
         printHelp();

@@ -46,6 +46,16 @@
 // скрипте) - мощность/частота настраиваются там же, простыми строками без
 // схлопывающихся секций и без поясняющих подписей - это редкие настройки, но, раз уж
 // оператор открыл модалку, лучше видеть их сразу целиком, без лишнего клика по каждой.
+// Там же, ниже - два порога ЗАЩИТЫ ОТ ПЕРЕГРЕВА (температура аварийного отключения
+// радио/точки доступа и температура восстановления, см. большой комментарий у
+// tempTripC/tempRecoverC в hub.ino) - в отличие от мощности/частоты это <input>, а не
+// <select> (значения произвольные, не из фиксированного набора), и заполняются они из
+// /api/status только ОДИН РАЗ за всю жизнь страницы (см. overheatInputsInitialized в
+// скрипте), а не на каждый тик - иначе набираемое оператором значение стиралось бы
+// прямо во время ввода. Обе настройки сохраняются одной кнопкой (см.
+// saveOverheatThresholds() в скрипте, POST /api/setOverheatThresholds) и в NVS на Хабе.
+// Если радио сейчас отключено из-за перегрева - об этом также сказано прямо в строке
+// температуры на главной странице (overheatShutdown из /api/status, см. refreshStatus()).
 //
 // НАЗВАНИЕ УСТРОЙСТВА: карточка показывает его вместо "Узел #idx", если
 // оно задано - редактируется в модальном окне (поле "Название" + кнопка
@@ -126,6 +136,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .modal-field { font-size:0.85em; margin-bottom:6px; color:#444; display:flex; justify-content:space-between; gap:10px; align-items:center; }
   .modal-field b { color:#222; font-weight:600; }
   .modal-field select { padding:4px 6px; border:1px solid #ccc; border-radius:4px; font-size:0.85em; }
+  .modal-field input[type=number] { width:70px; padding:4px 6px; border:1px solid #ccc; border-radius:4px; font-size:0.85em; }
   .name-edit { display:flex; gap:6px; align-items:center; }
   .name-edit input { width:130px; padding:4px 6px; border:1px solid #ccc; border-radius:4px; font-size:0.85em; }
   .name-edit button { padding:4px 9px; font-size:0.9em; }
@@ -221,16 +232,18 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!-- Модальное окно с настройками САМОГО ХАБА (не узла!) - температура кристалла,
      мощность передатчика Wi-Fi/ESP-NOW и частота процессора - отдельная от
      модалки устройства выше (свой backdrop, свой openHubModal()/closeHubModal() в
-     скрипте) - открывается шестеренкой в заголовке страницы. Три простые строки
-     (.modal-field, тот же паттерн, что и у MAC/Связь/Статус в модалке устройства) - без
-     схлопывающихся секций и без поясняющих подписей - настройки редкие, но всегда видны
-     целиком сразу, без лишнего клика. Списки в <select> строятся из TX_POWER_OPTIONS/
-     CPU_FREQ_OPTIONS в скрипте - тот же набор значений, что и в hub.ino
+     скрипте) - открывается шестеренкой в заголовке страницы. Температура/частота/
+     мощность - простые строки (.modal-field, тот же паттерн, что и у MAC/Связь/Статус в
+     модалке устройства) - без схлопывающихся секций и без поясняющих подписей - настройки
+     редкие, но всегда видны целиком сразу, без лишнего клика. Списки в <select> строятся из
+     TX_POWER_OPTIONS/CPU_FREQ_OPTIONS в скрипте - тот же набор значений, что и в hub.ino
      (TX_POWER_OPTIONS/CPU_FREQ_OPTIONS там) - дублируется вручную, потому что это JS, а не C++,
      общего enum'а между ними нет (та же ситуация, что с ACTION_OPEN/ACTION_CLOSE выше в
      valveButtonClick()). Температура здесь - второй, отдельный от главной страницы, DOM-элемент
      (id="modal-temp-value") - у главной страницы свой (id="temp-status"), оба обновляются
-     одним refreshStatus() независимо друг от друга (id не могут повторяться на странице). -->
+     одним refreshStatus() независимо друг от друга (id не могут повторяться на странице). Ниже
+     этих трёх строк - ещё два поля, УЖЕ С <input>, а не <select> - пороги ЗАЩИТЫ ОТ
+     ПЕРЕГРЕВА, см. их отдельный комментарий ниже у самих полей. -->
 <div class="modal-backdrop" id="hub-modal-backdrop">
   <div class="modal">
     <div class="modal-header">
@@ -245,6 +258,26 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div class="modal-field">
       <span>Мощность передатчика</span>
       <select id="tx-power-select" onchange="setTxPower(this)"></select>
+    </div>
+
+    <!-- Защита от перегрева (см. большой комментарий у tempTripC/tempRecoverC в hub.ino) - два порога,
+         каждый своим <input type=number> + общая кнопка "Сохранить" ниже (оба значения валидны
+         ТОЛЬКО ВМЕСТЕ, отдельной кнопки на каждое поле нет - см. saveOverheatThresholds() в
+         скрипте). Значения в эти поля проставляются ТОЛЬКО ОДИН РАЗ (см.
+         overheatInputsInitialized в refreshStatus()) - в отличие от <select> частоты/мощности
+         выше, это <input> - перезаписывать его каждые 2 сек значило бы стирать набираемое
+         оператором значение прямо во время ввода (та же причина, что и у #modal-duration в
+         модалке устройства). -->
+    <div class="modal-field">
+      <span>Температура аварии</span>
+      <input type="number" id="temp-trip-input" step="0.5" min="40" max="120">
+    </div>
+    <div class="modal-field">
+      <span>Температура восстановления</span>
+      <input type="number" id="temp-recover-input" step="0.5" min="40" max="120">
+    </div>
+    <div style="text-align:right; margin-top:8px;">
+      <button class="apply-btn" onclick="saveOverheatThresholds(this)">Сохранить</button>
     </div>
   </div>
 </div>
@@ -276,6 +309,11 @@ let typeSpecificBuiltFor = null;
 // просто скрыты через display:none у затемнённого фона, это не мешает им обновляться в
 // фоне).
 let hubModalOpen = false;
+
+// Поля порогов перегрева (#temp-trip-input/#temp-recover-input) заполняются из
+// /api/status только ОДИН РАЗ - см. использование ниже в refreshStatus() и
+// комментарий у самих полей в HTML выше.
+let overheatInputsInitialized = false;
 
 function openHubModal() {
   hubModalOpen = true;
@@ -838,6 +876,26 @@ async function refreshStatus() {
     if (typeof status.cpuFreqMhz === 'number') {
       setSelectValueEnsuringOption(cpuSelect, status.cpuFreqMhz, (v) => v + ' МГц (нестандартно)');
     }
+
+    // Пороги защиты от перегрева (tempTripC/tempRecoverC из /api/status, см. большой
+    // комментарий у tempTripC/tempRecoverC в hub.ino) - заполняются ТОЛЬКО ОДИН РАЗ за всю
+    // жизнь страницы (overheatInputsInitialized) - это <input>, не <select>, повторная
+    // установка .value каждые 2 сек стирала бы набираемое оператором значение
+    // прямо во время ввода (см. комментарий у самих полей в HTML).
+    if (!overheatInputsInitialized && typeof status.tempTripC === 'number' && typeof status.tempRecoverC === 'number') {
+      document.getElementById('temp-trip-input').value = status.tempTripC;
+      document.getElementById('temp-recover-input').value = status.tempRecoverC;
+      overheatInputsInitialized = true;
+    }
+
+    // Если радио сейчас отключено из-за перегрева (overheatShutdown из /api/status) -
+    // добавляем это к тексту строки температуры на главной странице - оператор должен
+    // видеть это, даже не открывая модалку, а не только по мигающему светодиоду
+    // аварии на самом устройстве.
+    if (status.overheatShutdown) {
+      const tempStatusEl = document.getElementById('temp-status');
+      tempStatusEl.textContent += ' — ESP-NOW отключено (перегрев)';
+    }
   } catch (e) {
     console.error('Не удалось получить статус Хаба', e);
   }
@@ -929,6 +987,27 @@ async function setCpuFreq(selectEl) {
     console.error('Не удалось изменить частоту процессора', e);
   }
   refreshStatus();
+}
+
+// Сохраняет оба порога защиты от перегрева одним запросом (POST /api/setOverheatThresholds,
+// см. handleApiSetOverheatThresholds() в hub.ino) - одна кнопка на оба поля, потому что
+// валидны они только вместе (температура аварии должна быть выше температуры
+// восстановления - сама проверка делается на стороне Хаба, здесь ничего не дублируется).
+// Обратная связь на кнопке - через flashButton(), тот же паттерн, что и у
+// saveModuleConfig()/saveDeviceName() выше.
+async function saveOverheatThresholds(btn) {
+  const trip = document.getElementById('temp-trip-input').value;
+  const recover = document.getElementById('temp-recover-input').value;
+  try {
+    const res = await fetch('/api/setOverheatThresholds', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'trip=' + trip + '&recover=' + recover
+    });
+    flashButton(btn, res.ok ? '✓ Сохранено' : '✗ Ошибка', res.ok);
+  } catch (e) {
+    flashButton(btn, '✗ Ошибка', false);
+  }
 }
 
 syncTime();
