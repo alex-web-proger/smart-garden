@@ -46,16 +46,16 @@
 // скрипте) - мощность/частота настраиваются там же, простыми строками без
 // схлопывающихся секций и без поясняющих подписей - это редкие настройки, но, раз уж
 // оператор открыл модалку, лучше видеть их сразу целиком, без лишнего клика по каждой.
-// Там же, ниже - два порога ЗАЩИТЫ ОТ ПЕРЕГРЕВА (температура аварийного отключения
-// радио/точки доступа и температура восстановления, см. большой комментарий у
-// tempTripC/tempRecoverC в hub.ino) - в отличие от мощности/частоты это <input>, а не
+// Там же, ниже - два порога УПРАВЛЕНИЯ ВЕНТИЛЯТОРОМ (температура его
+// включения и температура выключения, см. большой комментарий у
+// fanOnTempC/fanOffTempC в hub.ino) - в отличие от мощности/частоты это <input>, а не
 // <select> (значения произвольные, не из фиксированного набора), и заполняются они из
-// /api/status только ОДИН РАЗ за всю жизнь страницы (см. overheatInputsInitialized в
+// /api/status только ОДИН РАЗ за всю жизнь страницы (см. fanInputsInitialized в
 // скрипте), а не на каждый тик - иначе набираемое оператором значение стиралось бы
 // прямо во время ввода. Обе настройки сохраняются одной кнопкой (см.
-// saveOverheatThresholds() в скрипте, POST /api/setOverheatThresholds) и в NVS на Хабе.
-// Если радио сейчас отключено из-за перегрева - об этом также сказано прямо в строке
-// температуры на главной странице (overheatShutdown из /api/status, см. refreshStatus()).
+// saveFanThresholds() в скрипте, POST /api/setFanThresholds) и в NVS на Хабе.
+// Если вентилятор охлаждения сейчас включён - об этом также сказано прямо в строке
+// температуры на главной странице (fanOn из /api/status, см. refreshStatus()).
 //
 // НАЗВАНИЕ УСТРОЙСТВА: карточка показывает его вместо "Узел #idx", если
 // оно задано - редактируется в модальном окне (поле "Название" + кнопка
@@ -242,8 +242,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
      valveButtonClick()). Температура здесь - второй, отдельный от главной страницы, DOM-элемент
      (id="modal-temp-value") - у главной страницы свой (id="temp-status"), оба обновляются
      одним refreshStatus() независимо друг от друга (id не могут повторяться на странице). Ниже
-     этих трёх строк - ещё два поля, УЖЕ С <input>, а не <select> - пороги ЗАЩИТЫ ОТ
-     ПЕРЕГРЕВА, см. их отдельный комментарий ниже у самих полей. -->
+     этих трёх строк - ещё два поля, УЖЕ С <input>, а не <select> - пороги ВКЛЮЧЕНИЯ/
+     ВЫКЛЮЧЕНИЯ ВЕНТИЛЯТОРА, см. их отдельный комментарий ниже у самих полей. -->
 <div class="modal-backdrop" id="hub-modal-backdrop">
   <div class="modal">
     <div class="modal-header">
@@ -260,24 +260,24 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <select id="tx-power-select" onchange="setTxPower(this)"></select>
     </div>
 
-    <!-- Защита от перегрева (см. большой комментарий у tempTripC/tempRecoverC в hub.ino) - два порога,
+    <!-- Управление вентилятором охлаждения (см. большой комментарий у fanOnTempC/fanOffTempC в hub.ino) - два порога,
          каждый своим <input type=number> + общая кнопка "Сохранить" ниже (оба значения валидны
-         ТОЛЬКО ВМЕСТЕ, отдельной кнопки на каждое поле нет - см. saveOverheatThresholds() в
+         ТОЛЬКО ВМЕСТЕ, отдельной кнопки на каждое поле нет - см. saveFanThresholds() в
          скрипте). Значения в эти поля проставляются ТОЛЬКО ОДИН РАЗ (см.
-         overheatInputsInitialized в refreshStatus()) - в отличие от <select> частоты/мощности
+         fanInputsInitialized в refreshStatus()) - в отличие от <select> частоты/мощности
          выше, это <input> - перезаписывать его каждые 2 сек значило бы стирать набираемое
          оператором значение прямо во время ввода (та же причина, что и у #modal-duration в
          модалке устройства). -->
     <div class="modal-field">
-      <span>Температура аварии</span>
-      <input type="number" id="temp-trip-input" step="0.5" min="40" max="120">
+      <span>Температура включения вентилятора</span>
+      <input type="number" id="fan-on-input" step="0.5" min="40" max="120">
     </div>
     <div class="modal-field">
-      <span>Температура восстановления</span>
-      <input type="number" id="temp-recover-input" step="0.5" min="40" max="120">
+      <span>Температура выключения вентилятора</span>
+      <input type="number" id="fan-off-input" step="0.5" min="40" max="120">
     </div>
     <div style="text-align:right; margin-top:8px;">
-      <button class="apply-btn" onclick="saveOverheatThresholds(this)">Сохранить</button>
+      <button class="apply-btn" onclick="saveFanThresholds(this)">Сохранить</button>
     </div>
   </div>
 </div>
@@ -310,10 +310,10 @@ let typeSpecificBuiltFor = null;
 // фоне).
 let hubModalOpen = false;
 
-// Поля порогов перегрева (#temp-trip-input/#temp-recover-input) заполняются из
+// Поля порогов вентилятора (#fan-on-input/#fan-off-input) заполняются из
 // /api/status только ОДИН РАЗ - см. использование ниже в refreshStatus() и
 // комментарий у самих полей в HTML выше.
-let overheatInputsInitialized = false;
+let fanInputsInitialized = false;
 
 function openHubModal() {
   hubModalOpen = true;
@@ -877,24 +877,23 @@ async function refreshStatus() {
       setSelectValueEnsuringOption(cpuSelect, status.cpuFreqMhz, (v) => v + ' МГц (нестандартно)');
     }
 
-    // Пороги защиты от перегрева (tempTripC/tempRecoverC из /api/status, см. большой
-    // комментарий у tempTripC/tempRecoverC в hub.ino) - заполняются ТОЛЬКО ОДИН РАЗ за всю
-    // жизнь страницы (overheatInputsInitialized) - это <input>, не <select>, повторная
+    // Пороги включения/выключения вентилятора (fanOnTempC/fanOffTempC из /api/status, см. большой
+    // комментарий у fanOnTempC/fanOffTempC в hub.ino) - заполняются ТОЛЬКО ОДИН РАЗ за всю
+    // жизнь страницы (fanInputsInitialized) - это <input>, не <select>, повторная
     // установка .value каждые 2 сек стирала бы набираемое оператором значение
     // прямо во время ввода (см. комментарий у самих полей в HTML).
-    if (!overheatInputsInitialized && typeof status.tempTripC === 'number' && typeof status.tempRecoverC === 'number') {
-      document.getElementById('temp-trip-input').value = status.tempTripC;
-      document.getElementById('temp-recover-input').value = status.tempRecoverC;
-      overheatInputsInitialized = true;
+    if (!fanInputsInitialized && typeof status.fanOnTempC === 'number' && typeof status.fanOffTempC === 'number') {
+      document.getElementById('fan-on-input').value = status.fanOnTempC;
+      document.getElementById('fan-off-input').value = status.fanOffTempC;
+      fanInputsInitialized = true;
     }
 
-    // Если радио сейчас отключено из-за перегрева (overheatShutdown из /api/status) -
-    // добавляем это к тексту строки температуры на главной странице - оператор должен
-    // видеть это, даже не открывая модалку, а не только по мигающему светодиоду
-    // аварии на самом устройстве.
-    if (status.overheatShutdown) {
+    // Если вентилятор сейчас включён (fanOn из /api/status) - добавляем это к тексту
+    // строки температуры на главной странице - оператор должен видеть это, даже не
+    // открывая модалку.
+    if (status.fanOn) {
       const tempStatusEl = document.getElementById('temp-status');
-      tempStatusEl.textContent += ' — ESP-NOW отключено (перегрев)';
+      tempStatusEl.textContent += ' — вентилятор включён';
     }
   } catch (e) {
     console.error('Не удалось получить статус Хаба', e);
@@ -989,20 +988,20 @@ async function setCpuFreq(selectEl) {
   refreshStatus();
 }
 
-// Сохраняет оба порога защиты от перегрева одним запросом (POST /api/setOverheatThresholds,
-// см. handleApiSetOverheatThresholds() в hub.ino) - одна кнопка на оба поля, потому что
-// валидны они только вместе (температура аварии должна быть выше температуры
-// восстановления - сама проверка делается на стороне Хаба, здесь ничего не дублируется).
-// Обратная связь на кнопке - через flashButton(), тот же паттерн, что и у
+// Сохраняет оба порога включения/выключения вентилятора одним запросом (POST
+// /api/setFanThresholds, см. handleApiSetFanThresholds() в hub.ino) - одна кнопка на оба
+// поля, потому что валидны они только вместе (температура включения должна быть выше
+// температуры выключения - сама проверка делается на стороне Хаба, здесь ничего не
+// дублируется). Обратная связь на кнопке - через flashButton(), тот же паттерн, что и у
 // saveModuleConfig()/saveDeviceName() выше.
-async function saveOverheatThresholds(btn) {
-  const trip = document.getElementById('temp-trip-input').value;
-  const recover = document.getElementById('temp-recover-input').value;
+async function saveFanThresholds(btn) {
+  const on = document.getElementById('fan-on-input').value;
+  const off = document.getElementById('fan-off-input').value;
   try {
-    const res = await fetch('/api/setOverheatThresholds', {
+    const res = await fetch('/api/setFanThresholds', {
       method: 'POST',
       headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: 'trip=' + trip + '&recover=' + recover
+      body: 'on=' + on + '&off=' + off
     });
     flashButton(btn, res.ok ? '✓ Сохранено' : '✗ Ошибка', res.ok);
   } catch (e) {

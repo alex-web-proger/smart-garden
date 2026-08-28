@@ -189,96 +189,63 @@ const char *RADIO_NVS_NAMESPACE = "smartgarden";
 const char *NVS_KEY_TX_POWER = "txpower";
 const char *NVS_KEY_CPU_FREQ = "cpufreq";
 
-// --- Защита от перегрева ---
+// --- Управление вентилятором охлаждения ---
 // Если температура кристалла ESP32 (см. temperatureRead(), тот же встроенный
-// датчик, что и в /api/status) достигает порога аварийного отключения
-// (tempTripC), Хаб останавливает ВСЮ радиосвязь и выключает точку доступа (если
-// она была включена) - радиосвязь и Wi-Fi нагружают чип и вносят заметный
-// вклад в его собственный нагрев.
+// датчик, что и в /api/status) достигает порога включения (fanOnTempC), Хаб
+// выставляет HIGH на пине вентилятора (FAN_PIN) - предполагается, что к этому
+// пину через транзисторный/релейный ключ подключен вентилятор охлаждения (сам
+// GPIO ток вентилятора не тянет). Как только температура опустится до порога
+// выключения (fanOffTempC, обязан быть строго ниже fanOnTempC - см.
+// FAN_MIN_HYSTERESIS_C ниже, без зазора между порогами возможен дребезг прямо на
+// границе), пин возвращается в LOW.
 //
-// ВАЖНО (найдено на реальном железе, см. историю): "останавливает радиосвязь" ЗДЕСЬ ЗНАЧИТ
-// ПРОГРАММНО, а НЕ физически (НЕ вызываем esp_now_deinit()) - ESP-NOW остаётся
-// инициализирован, но весь входящий/исходящий трафик молча игнорируется пока
-// действует radioOverheatShutdown (см. sendCommand()/sendHubAnnounce()/sendSetConfig() и
-// цикл разбора очереди в loop() ниже). Причина - реально наблюдённый на
-// железе баг ESP32 (ардуино-ядро): после esp_now_deinit() (когда больше ничего
-// другого не держит радио активным - точка доступа и так выключена большую часть
-// времени по умолчанию) встроенный датчик температуры "замерзает" и начинает
-// возвращать ОДНО И ТО ЖЕ значение вместо реальной текущей температуры (оба
-// датчика сидят на общем аналоговом тракте с RF-калибровкой Wi-Fi) - из-за этого
-// ранняя версия этой защиты (действительно вызывавшая esp_now_deinit()/повторную
-// esp_now_init() при восстановлении) на реальном железе так и делала: охлаждалась успешно,
-// но температура в логах замиралась на одном числе, порог восстановления никогда не
-// достигался, и радио так и оставалось отключённым навсегда. Сейчас аппаратное
-// состояние радио 100% стабильно весь время работы Хаба, поэтому и датчик
-// температуры ничем не трогается.
+// В ОТЛИЧИЕ от более ранней версии этой защиты, здесь НЕТ никакого влияния на
+// радиосвязь/точку доступа - ESP-NOW и Wi-Fi работают одинаково вне зависимости
+// от температуры и состояния вентилятора, регулировка теплового режима сейчас
+// полностью аппаратная (вентилятор), а не программная (отключение радио).
 //
-// Восстановление происходит АВТОМАТИЧЕСКИ, но только для ESP-NOW - как только
-// температура опустится до порога восстановления (tempRecoverC, обязан
-// быть строго ниже tempTripC - см. OVERHEAT_MIN_HYSTERESIS_C ниже, без зазора между
-// порогами возможно дребезжание защиты прямо на границе). Точка доступа
-// НЕ включается сама - оператор должен включить её явно кнопкой, точно так же, как и
-// при обычном сбросе Хаба (см. большой комментарий у apEnabled выше) - авария не
-// должна тихо "рассосаться" сама по себе без ведома оператора: если Хаб грелся
-// настолько, что сработала защита, разумно, чтобы человек посмотрел на
-// ситуацию, прежде чем снова открывать веб-интерфейс наружу.
-//
-// Пока действует отключение, СВЕТОДИОД АВАРИИ (OVERHEAT_LED_PIN, в норме не
-// горит) мигает - см. updateOverheatLed() ниже - и каждую минуту в Serial
-// печатается текущая температура (см. updateOverheatProtection() ниже), чтобы
-// на месте было видно, насколько ещё далеко до восстановления, не дожидаясь
-// его самого.
+// Пока вентилятор включён, каждую минуту в Serial печатается текущая температура
+// (см. updateFanControl() ниже), чтобы на месте было видно, насколько ещё далеко
+// до порога выключения, не дожидаясь его самого.
 //
 // Оба порога НАСТРАИВАЕМЫЕ (веб-интерфейс - модалка "Настройки Хаба", внизу;
-// либо тем же значением через /api/setOverheatThresholds) и СОХРАНЯЮТСЯ в NVS (см.
-// saveOverheatThresholdsToNVS()/loadOverheatThresholdsFromNVS() ниже) - тот же
+// либо тем же значением через /api/setFanThresholds) и СОХРАНЯЮТСЯ в NVS (см.
+// saveFanThresholdsToNVS()/loadFanThresholdsFromNVS() ниже) - тот же
 // принцип, что и у мощности передатчика/частоты процессора выше: оператор
 // настраивает один раз, значение переживает любой последующий сброс Хаба. Также
 // выводятся Serial-командой 'status' (см. SerialCommands.cpp).
-const float DEFAULT_TEMP_TRIP_C = 80.0;    // дефолт порога аварийного отключения, °C
-const float DEFAULT_TEMP_RECOVER_C = 70.0; // дефолт порога восстановления, °C
-const float OVERHEAT_TEMP_MIN_C = 40.0;    // ниже этого порог не имеет смысла - ESP32 в норме
+const float DEFAULT_FAN_ON_TEMP_C = 80.0;  // дефолт порога включения вентилятора, °C
+const float DEFAULT_FAN_OFF_TEMP_C = 70.0; // дефолт порога выключения вентилятора, °C
+const float FAN_TEMP_MIN_C = 40.0;         // ниже этого порог не имеет смысла - ESP32 в норме
                                             // и так теплее комнатной температуры
-const float OVERHEAT_TEMP_MAX_C = 120.0;   // паспортный предел ESP32 около 125 °C - выше не пускаем
-const float OVERHEAT_MIN_HYSTERESIS_C = 2.0; // минимальный зазор trip-recover - без него защита
-                                              // могла бы дребезжать (включаться/выключаться) прямо
-                                              // на границе одного порога
+const float FAN_TEMP_MAX_C = 120.0;        // паспортный предел ESP32 около 125 °C - выше не пускаем
+const float FAN_MIN_HYSTERESIS_C = 2.0;    // минимальный зазор on-off - без него включение/
+                                            // выключение могло бы дребезжать прямо на границе
+                                            // одного порога
 
-float tempTripC = DEFAULT_TEMP_TRIP_C;
-float tempRecoverC = DEFAULT_TEMP_RECOVER_C;
+float fanOnTempC = DEFAULT_FAN_ON_TEMP_C;
+float fanOffTempC = DEFAULT_FAN_OFF_TEMP_C;
 
-// true, пока действует аварийное отключение радио по перегреву (см.
-// updateOverheatProtection() ниже) - НЕ то же самое, что "radioReady==false с
-// самого старта" (см. комментарий у radioReady ниже) - тот случай означает
-// провал инициализации ESP-NOW В SETUP() - аппаратная неисправность/отказ ядра. Этот
-// флаг - намеренная, временная и ожидаемо обратимая программная остановка уже
-// работавшего радио - само радио при этом НЕ трогается (radioReady остаётся true), именно
-// поэтому updateStatusLed() ниже никак не реагирует на этот флаг (ей и не нужно - за это
-// отвечает отдельный светодиод, см. OVERHEAT_LED_PIN и updateOverheatLed() ниже).
-bool radioOverheatShutdown = false;
+// true, пока пин вентилятора (FAN_PIN) держится HIGH - см. updateFanControl()
+// ниже. Отражает ТОЛЬКО текущее состояние управления вентилятором - на
+// радиосвязь/точку доступа никак не влияет.
+bool fanOn = false;
 
-// Светодиод аварии перегрева - в норме НЕ горит, начинает мигать, как
-// только сработало отключение по температуре (см. updateOverheatLed() ниже), и
-// гаснет обратно сразу после восстановления. Отдельный пин от AP_LED_PIN - два
-// разных по смыслу события (обычное состояние точки доступа/отказ радио
-// на старте vs авария по температуре) не должны делить один светодиод, иначе
-// оператору на месте пришлось бы гадать, что именно тот пытается сказать
-// морганием. GPIO4 выбран как обычно свободный на большинстве отладочных
-// плат ESP32 (не занят I2C/кнопкой/AP_LED_PIN выше) - если распиновка
-// конкретной платы отличается - поменяйте define.
-#define OVERHEAT_LED_PIN 4
-const unsigned long OVERHEAT_LED_BLINK_MS = 400; // период мигания светодиода аварии, мс
-unsigned long lastOverheatLedBlinkMs = 0;
-bool overheatLedState = false;
+// Пин управления вентилятором (через внешний ключ - транзистор/реле, GPIO
+// сам вентилятор не питает). HIGH = вентилятор включён. GPIO4 выбран как
+// обычно свободный на большинстве отладочных плат ESP32 (не занят
+// I2C/кнопкой/AP_LED_PIN выше) - если распиновка конкретной платы отличается -
+// поменяйте define.
+#define FAN_PIN 4
 
-const unsigned long OVERHEAT_CHECK_INTERVAL_MS = 3000UL;     // как часто проверяем температуру, мс
-const unsigned long OVERHEAT_TEMP_LOG_INTERVAL_MS = 60000UL; // как часто логируем её в Serial,
-                                                               // пока авария активна
-unsigned long lastOverheatCheckMs = 0;
-unsigned long lastOverheatTempLogMs = 0;
+const unsigned long FAN_CHECK_INTERVAL_MS = 3000UL;        // как часто проверяем температуру, мс
+const unsigned long FAN_ON_TEMP_LOG_INTERVAL_MS = 60000UL; // как часто логируем её в Serial,
+                                                              // пока вентилятор включён
+unsigned long lastFanCheckMs = 0;
+unsigned long lastFanTempLogMs = 0;
 
-const char *NVS_KEY_TEMP_TRIP = "tempTrip";
-const char *NVS_KEY_TEMP_RECOVER = "tempRecover";
+const char *NVS_KEY_FAN_ON_TEMP = "fanOnTemp";
+const char *NVS_KEY_FAN_OFF_TEMP = "fanOffTemp";
 
 // Имя хоста для mDNS (протокол "Bonjour"/"zeroconf", в Linux обычно
 // реализован через avahi) - см. большой комментарий про домен в начале
@@ -409,9 +376,7 @@ void prepareHeader(MsgType mType, const uint8_t *receiverMac) {
 // уже работающие узлы получали время сразу, не дожидаясь своего
 // собственного очередного MSG_CONFIG (база ~1 час) или перезагрузки Хаба.
 void sendHubAnnounce() {
-    if (!radioReady || radioOverheatShutdown) return; // радио не инициализировано либо
-                                                        // программно остановлено из-за перегрева (см.
-                                                        // большой комментарий у tempTripC в начале файла) - отправлять нечем/нельзя
+    if (!radioReady) return; // радио не инициализировано - отправлять нечем
     prepareHeader(MSG_CONFIG, BROADCAST_MAC);
     txPacket.payload.hub.epoch = timeSynced ? (uint32_t) time(nullptr) : 0;
     esp_now_send(BROADCAST_MAC, (uint8_t *) &txPacket, sizeof(txPacket));
@@ -420,8 +385,8 @@ void sendHubAnnounce() {
 }
 
 void sendCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uint8_t mode, uint16_t durationSec, uint16_t volumeL) {
-    if (!radioReady || radioOverheatShutdown) {
-        Serial.println("ESP-NOW недоступно (не инициализировано либо отключено из-за перегрева) - команда не отправлена.");
+    if (!radioReady) {
+        Serial.println("ESP-NOW не инициализировано - команда не отправлена.");
         return;
     }
     if (!deviceManager.isValid(deviceIdx)) {
@@ -459,8 +424,8 @@ void sendCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uint8_t mod
 // и может отклонить значение через MSG_ACK{status=1}, даже если оно прошло эту проверку
 // здесь - Хаб не знает физическую емкость/комплектацию конкретного узла.
 void sendSetConfig(int deviceIdx, uint8_t valveCount, uint8_t mode, uint8_t hasFlowSensor, uint16_t pulsesPerLiter) {
-    if (!radioReady || radioOverheatShutdown) {
-        Serial.println("ESP-NOW недоступно (не инициализировано либо отключено из-за перегрева) - конфигурация не отправлена.");
+    if (!radioReady) {
+        Serial.println("ESP-NOW не инициализировано - конфигурация не отправлена.");
         return;
     }
     if (!deviceManager.isValid(deviceIdx)) {
@@ -664,70 +629,42 @@ void updateStatusLed() {
     }
 }
 
-// Проверяет температуру кристалла и держит состояние защиты от перегрева - см. большой
-// комментарий у tempTripC/tempRecoverC в начале файла. Вызывается из loop() на каждой
-// итерации, но сама проверка ограничена OVERHEAT_CHECK_INTERVAL_MS - temperatureRead()
+// Проверяет температуру кристалла и держит состояние вентилятора (пин FAN_PIN) - см.
+// большой комментарий у fanOnTempC/fanOffTempC в начале файла. Вызывается из loop() на
+// каждой итерации, но сама проверка ограничена FAN_CHECK_INTERVAL_MS - temperatureRead()
 // достаточно дёшева, но незачем дёргать её тысячи раз в секунду ради значения,
 // которое физически не может измениться так быстро.
-void updateOverheatProtection() {
-    if (millis() - lastOverheatCheckMs < OVERHEAT_CHECK_INTERVAL_MS) return;
-    lastOverheatCheckMs = millis();
+void updateFanControl() {
+    if (millis() - lastFanCheckMs < FAN_CHECK_INTERVAL_MS) return;
+    lastFanCheckMs = millis();
     float tempC = temperatureRead();
 
-    if (!radioOverheatShutdown) {
-        if (tempC < tempTripC) return; // всё в порядке, проверять больше нечего
+    if (!fanOn) {
+        if (tempC < fanOnTempC) return; // всё в порядке, проверять больше нечего
 
-        // ВХОД в аварийное состояние - см. большой комментарий у tempTripC/tempRecoverC
-        // в начале файла: НЕ трогаем радио физически (НЕ esp_now_deinit()) - только
-        // программный флаг, весь трафик игнорируется, пока он взведён (см.
-        // sendCommand()/sendHubAnnounce()/sendSetConfig() и цикл разбора очереди в loop()).
-        radioOverheatShutdown = true;
-        if (apEnabled) setApEnabled(false);
-        lastOverheatTempLogMs = millis(); // первый периодический лог - через OVERHEAT_TEMP_LOG_INTERVAL_MS,
-                                           // само событие и так печатается ниже
-        Serial.printf("АВАРИЯ ПЕРЕГРЕВА: температура %.1f °C >= порога отключения %.1f °C - "
-                      "радиосвязь и точка доступа ОТКЛЮЧЕНЫ.\n", tempC, tempTripC);
+        fanOn = true;
+        digitalWrite(FAN_PIN, HIGH);
+        lastFanTempLogMs = millis(); // первый периодический лог - через FAN_ON_TEMP_LOG_INTERVAL_MS,
+                                      // само событие и так печатается ниже
+        Serial.printf("Вентилятор ВКЛЮЧЁН: температура %.1f °C >= порога включения %.1f °C\n",
+                      tempC, fanOnTempC);
         return;
     }
 
-    // Уже в аварии - раз в OVERHEAT_TEMP_LOG_INTERVAL_MS печатаем текущую температуру,
-    // чтобы на месте было видно, насколько ещё далеко до восстановления.
-    if (millis() - lastOverheatTempLogMs >= OVERHEAT_TEMP_LOG_INTERVAL_MS) {
-        lastOverheatTempLogMs = millis();
-        Serial.printf("Перегрев: текущая температура %.1f °C (восстановление при <= %.1f °C)\n",
-                      tempC, tempRecoverC);
+    // Вентилятор уже включён - раз в FAN_ON_TEMP_LOG_INTERVAL_MS печатаем текущую
+    // температуру, чтобы на месте было видно, насколько ещё далеко до выключения.
+    if (millis() - lastFanTempLogMs >= FAN_ON_TEMP_LOG_INTERVAL_MS) {
+        lastFanTempLogMs = millis();
+        Serial.printf("Вентилятор работает: текущая температура %.1f °C (выключение при <= %.1f °C)\n",
+                      tempC, fanOffTempC);
     }
 
-    if (tempC > tempRecoverC) return; // ещё не остыл достаточно
+    if (tempC > fanOffTempC) return; // ещё не остыл достаточно
 
-    // ВОССТАНОВЛЕНИЕ - ТОЛЬКО ESP-NOW. Точка доступа НАМЕРЕННО НЕ включается
-    // здесь - см. большой комментарий у tempTripC/tempRecoverC в начале файла.
-    // Само радио аппаратно и не выключалось - просто снимаем программный флаг.
-    radioOverheatShutdown = false;
-    Serial.printf("Перегрев устранён: температура %.1f °C <= порога восстановления %.1f °C - "
-                  "радиосвязь восстановлена. Точку доступа нужно включить кнопкой вручную.\n",
-                  tempC, tempRecoverC);
-}
-
-// Мигает светодиодом аварии (OVERHEAT_LED_PIN), пока действует отключение по
-// перегреву - в отличие от updateStatusLed() выше, этот светодиод в норме всегда
-// погашен, поэтому явно гасим его при выходе из аварии (а не просто перестаём
-// мигать), чтобы не оставить его случайно включённым, если выход случился ровно на
-// тот момент, когда светодиод был включён.
-void updateOverheatLed() {
-    if (!radioOverheatShutdown) {
-        if (overheatLedState) { // избегаем лишних digitalWrite() на каждой итерации loop(),
-                                 // когда светодиод и так уже погашен
-            overheatLedState = false;
-            digitalWrite(OVERHEAT_LED_PIN, LOW);
-        }
-        return;
-    }
-    if (millis() - lastOverheatLedBlinkMs >= OVERHEAT_LED_BLINK_MS) {
-        lastOverheatLedBlinkMs = millis();
-        overheatLedState = !overheatLedState;
-        digitalWrite(OVERHEAT_LED_PIN, overheatLedState ? HIGH : LOW);
-    }
+    fanOn = false;
+    digitalWrite(FAN_PIN, LOW);
+    Serial.printf("Вентилятор ВЫКЛЮЧЁН: температура %.1f °C <= порога выключения %.1f °C\n",
+                  tempC, fanOffTempC);
 }
 
 // --- Веб-интерфейс ---
@@ -967,12 +904,12 @@ void handleApiStatus() {
     // достаточно, для прецизионных измерений - нет. String(float) округляет до 2 знаков после запятой
     // по умолчанию - достаточно для отображения.
     json += ",\"chipTempC\":" + String(temperatureRead(), 1);
-    // Пороги защиты от перегрева и текущее состояние защиты (см. большой
-    // комментарий у tempTripC/tempRecoverC выше) - веб-страница использует первые два,
+    // Пороги включения/выключения вентилятора и текущее состояние самого вентилятора (см. большой
+    // комментарий у fanOnTempC/fanOffTempC выше) - веб-страница использует первые два,
     // чтобы заполнить поля в модалке "Настройки Хаба" текущими значениями.
-    json += ",\"tempTripC\":" + String(tempTripC, 1);
-    json += ",\"tempRecoverC\":" + String(tempRecoverC, 1);
-    json += ",\"overheatShutdown\":" + String(radioOverheatShutdown ? "true" : "false");
+    json += ",\"fanOnTempC\":" + String(fanOnTempC, 1);
+    json += ",\"fanOffTempC\":" + String(fanOffTempC, 1);
+    json += ",\"fanOn\":" + String(fanOn ? "true" : "false");
     // Текущая мощность передатчика - сырое число в четвертях дБм (см. TxPowerOption выше,
     // wifi_power_t неявно конвертируется в int) - веб-страница сама делит на 4 для отображения.
     json += ",\"txPowerQuarterDbm\":" + String((int) WiFi.getTxPower());
@@ -1063,53 +1000,53 @@ void loadRadioSettingsFromNVS() {
     }
 }
 
-// Симметрично saveTxPowerToNVS()/saveCpuFreqToNVS() выше - для порогов защиты от
-// перегрева (см. большой комментарий у tempTripC/tempRecoverC в начале файла). Сохраняются
+// Симметрично saveTxPowerToNVS()/saveCpuFreqToNVS() выше - для порогов включения/выключения
+// вентилятора (см. большой комментарий у fanOnTempC/fanOffTempC в начале файла). Сохраняются
 // ОБА порога одним вызовом (не по отдельности) - именно потому что валидны они
-// только ВМЕСТЕ (см. OVERHEAT_MIN_HYSTERESIS_C выше) - сохранение только одного порога
+// только ВМЕСТЕ (см. FAN_MIN_HYSTERESIS_C выше) - сохранение только одного порога
 // без другого могло бы на мгновение оставить в NVS несогласованную пару, если процесс
 // прервётся между двумя put*().
-void saveOverheatThresholdsToNVS(float trip, float recover) {
+void saveFanThresholdsToNVS(float onTemp, float offTemp) {
     Preferences prefs;
     prefs.begin(RADIO_NVS_NAMESPACE, false);
-    prefs.putFloat(NVS_KEY_TEMP_TRIP, trip);
-    prefs.putFloat(NVS_KEY_TEMP_RECOVER, recover);
+    prefs.putFloat(NVS_KEY_FAN_ON_TEMP, onTemp);
+    prefs.putFloat(NVS_KEY_FAN_OFF_TEMP, offTemp);
     prefs.end();
 }
 
-// Восстанавливает пороги защиты от перегрева из NVS - вызывается один раз из
+// Восстанавливает пороги включения/выключения вентилятора из NVS - вызывается один раз из
 // setup(), рядом с loadRadioSettingsFromNVS() (та же идея: без сети/веб-интерфейса
-// защита должна работать с настройками оператора, а не с дефолтами прошивки). В
+// управление вентилятором должно работать с настройками оператора, а не с дефолтами прошивки). В
 // отличие от TX_POWER_OPTIONS/CPU_FREQ_OPTIONS (сверка с фиксированным набором
 // значений) здесь произвольные float - поэтому валидация другая: диапазон
-// [OVERHEAT_TEMP_MIN_C, OVERHEAT_TEMP_MAX_C] для каждого порога И обязательный зазор
-// между ними (OVERHEAT_MIN_HYSTERESIS_C) - та же проверка, что и в
-// handleApiSetOverheatThresholds() ниже. Если сохранённая пара НЕ проходит эту
+// [FAN_TEMP_MIN_C, FAN_TEMP_MAX_C] для каждого порога И обязательный зазор
+// между ними (FAN_MIN_HYSTERESIS_C) - та же проверка, что и в
+// handleApiSetFanThresholds() ниже. Если сохранённая пара НЕ проходит эту
 // проверку (повреждение NVS, ручная правка через другой инструмент) - оба
 // порога молча остаются дефолтными (уже выставлены при объявлении переменных
 // выше), а НЕ применяется частично валидная/сырая пара.
-void loadOverheatThresholdsFromNVS() {
+void loadFanThresholdsFromNVS() {
     Preferences prefs;
     prefs.begin(RADIO_NVS_NAMESPACE, true); // read-only
-    bool hasTrip = prefs.isKey(NVS_KEY_TEMP_TRIP);
-    bool hasRecover = prefs.isKey(NVS_KEY_TEMP_RECOVER);
-    float savedTrip = hasTrip ? prefs.getFloat(NVS_KEY_TEMP_TRIP) : 0;
-    float savedRecover = hasRecover ? prefs.getFloat(NVS_KEY_TEMP_RECOVER) : 0;
+    bool hasOn = prefs.isKey(NVS_KEY_FAN_ON_TEMP);
+    bool hasOff = prefs.isKey(NVS_KEY_FAN_OFF_TEMP);
+    float savedOn = hasOn ? prefs.getFloat(NVS_KEY_FAN_ON_TEMP) : 0;
+    float savedOff = hasOff ? prefs.getFloat(NVS_KEY_FAN_OFF_TEMP) : 0;
     prefs.end();
 
-    if (!hasTrip || !hasRecover) return; // ничего не сохранено - остаёмся на дефолтах
+    if (!hasOn || !hasOff) return; // ничего не сохранено - остаёмся на дефолтах
 
-    if (savedTrip < OVERHEAT_TEMP_MIN_C || savedTrip > OVERHEAT_TEMP_MAX_C ||
-        savedRecover < OVERHEAT_TEMP_MIN_C || savedRecover > OVERHEAT_TEMP_MAX_C ||
-        savedTrip - savedRecover < OVERHEAT_MIN_HYSTERESIS_C) {
-        Serial.println("Сохранённые в NVS пороги перегрева некорректны - использую дефолты.");
+    if (savedOn < FAN_TEMP_MIN_C || savedOn > FAN_TEMP_MAX_C ||
+        savedOff < FAN_TEMP_MIN_C || savedOff > FAN_TEMP_MAX_C ||
+        savedOn - savedOff < FAN_MIN_HYSTERESIS_C) {
+        Serial.println("Сохранённые в NVS пороги вентилятора некорректны - использую дефолты.");
         return;
     }
 
-    tempTripC = savedTrip;
-    tempRecoverC = savedRecover;
-    Serial.printf("Пороги перегрева восстановлены из NVS: отключение %.1f °C, восстановление %.1f °C\n",
-                  tempTripC, tempRecoverC);
+    fanOnTempC = savedOn;
+    fanOffTempC = savedOff;
+    Serial.printf("Пороги вентилятора восстановлены из NVS: включение %.1f °C, выключение %.1f °C\n",
+                  fanOnTempC, fanOffTempC);
 }
 
 // POST /api/setTxPower - form-urlencoded: value (целое число в четвертях дБм, то есть сырое значение
@@ -1169,43 +1106,41 @@ void handleApiSetCpuFreq() {
     server.send(400, "text/plain", "invalid value - not in the allowed set");
 }
 
-// POST /api/setOverheatThresholds - form-urlencoded: trip, recover (оба - десятичные
-// числа в °C). Проверяется диапазон [OVERHEAT_TEMP_MIN_C, OVERHEAT_TEMP_MAX_C] для каждого
-// порога и обязательный зазор между ними (OVERHEAT_MIN_HYSTERESIS_C, см. комментарий у
-// tempTripC/tempRecoverC в начале файла) - без зазора защита могла бы дребезжать прямо
-// на границе одного порога. При успехе СОХРАНЯЕТ пороги в NVS (см.
-// saveOverheatThresholdsToNVS() выше), поэтому новые значения переживут следующий сброс Хаба
-// (см. loadOverheatThresholdsFromNVS(), вызывается из setup()). Ничего не делает с ТЕКУЩИМ
-// состоянием радио (radioOverheatShutdown) - если Хаб прямо сейчас в аварии, новые
-// пороги подхватятся уже следующей проверкой из updateOverheatProtection().
-void handleApiSetOverheatThresholds() {
-    if (!server.hasArg("trip") || !server.hasArg("recover")) {
-        server.send(400, "text/plain", "missing trip or recover");
+// POST /api/setFanThresholds - form-urlencoded: on, off (оба - десятичные
+// числа в °C). Проверяется диапазон [FAN_TEMP_MIN_C, FAN_TEMP_MAX_C] для каждого
+// порога и обязательный зазор между ними (FAN_MIN_HYSTERESIS_C, см. комментарий у
+// fanOnTempC/fanOffTempC в начале файла) - без зазора включение/выключение могло бы
+// дребезжать прямо на границе одного порога. При успехе СОХРАНЯЕТ пороги в NVS (см.
+// saveFanThresholdsToNVS() выше), поэтому новые значения переживут следующий сброс Хаба
+// (см. loadFanThresholdsFromNVS(), вызывается из setup()). Ничего не делает с ТЕКУЩИМ
+// состоянием вентилятора (fanOn) - если он прямо сейчас включён, новые пороги
+// подхватятся уже следующей проверкой из updateFanControl().
+void handleApiSetFanThresholds() {
+    if (!server.hasArg("on") || !server.hasArg("off")) {
+        server.send(400, "text/plain", "missing on or off");
         return;
     }
-    float trip = server.arg("trip").toFloat();
-    float recover = server.arg("recover").toFloat();
-    if (trip < OVERHEAT_TEMP_MIN_C || trip > OVERHEAT_TEMP_MAX_C ||
-        recover < OVERHEAT_TEMP_MIN_C || recover > OVERHEAT_TEMP_MAX_C) {
-        server.send(400, "text/plain", "trip/recover out of allowed range");
+    float onTemp = server.arg("on").toFloat();
+    float offTemp = server.arg("off").toFloat();
+    if (onTemp < FAN_TEMP_MIN_C || onTemp > FAN_TEMP_MAX_C ||
+        offTemp < FAN_TEMP_MIN_C || offTemp > FAN_TEMP_MAX_C) {
+        server.send(400, "text/plain", "on/off out of allowed range");
         return;
     }
-    if (trip - recover < OVERHEAT_MIN_HYSTERESIS_C) {
-        server.send(400, "text/plain", "trip must be at least OVERHEAT_MIN_HYSTERESIS_C above recover");
+    if (onTemp - offTemp < FAN_MIN_HYSTERESIS_C) {
+        server.send(400, "text/plain", "on must be at least FAN_MIN_HYSTERESIS_C above off");
         return;
     }
-    tempTripC = trip;
-    tempRecoverC = recover;
-    saveOverheatThresholdsToNVS(tempTripC, tempRecoverC);
-    Serial.printf("Пороги перегрева обновлены: отключение %.1f °C, восстановление %.1f °C\n",
-                  tempTripC, tempRecoverC);
+    fanOnTempC = onTemp;
+    fanOffTempC = offTemp;
+    saveFanThresholdsToNVS(fanOnTempC, fanOffTempC);
+    Serial.printf("Пороги вентилятора обновлены: включение %.1f °C, выключение %.1f °C\n",
+                  fanOnTempC, fanOffTempC);
     server.send(200, "text/plain", "ok");
 }
 
 // Инициализация ESP-NOW: колбек приёма + широковещательный "пир". Вызывается РОВНО ОДИН
-// РАЗ из setup() (не при восстановлении после перегрева - там радио аппаратно и не
-// выключалось, см. большой комментарий у tempTripC/tempRecoverC в начале файла - повторная
-// инициализация там не нужна). Вынесена в отдельную функцию всё равно ради читаемости
+// РАЗ из setup(). Вынесена в отдельную функцию всё равно ради читаемости
 // setup() (отдельный, понятно названный кусок логики лучше одной большой ветки if/else в
 // теле setup()). Очередь входящих пакетов (incomingPacketQueue) сюда НЕ входит - она
 // создаётся отдельно в setup(), ДО этого вызова.
@@ -1231,8 +1166,8 @@ void setup() {
 
     pinMode(AP_LED_PIN, OUTPUT);
  //   digitalWrite(AP_LED_PIN, LOW); // безопасный начальный дефолт - реальное состояние выставит setApEnabled(), когда оператор явно включит AP
-    pinMode(OVERHEAT_LED_PIN, OUTPUT);
-    digitalWrite(OVERHEAT_LED_PIN, LOW); // в норме не горит - см. большой комментарий у OVERHEAT_LED_PIN в начале файла
+    pinMode(FAN_PIN, OUTPUT);
+    digitalWrite(FAN_PIN, LOW); // вентилятор выключен по умолчанию при старте - см. updateFanControl() выше
     apButton.begin(AP_BUTTON_PIN, AP_BUTTON_DEBOUNCE_MS);
 
     // --- DS3231 ---
@@ -1279,10 +1214,10 @@ void setup() {
     // выше и большой комментарий у TX_POWER_OPTIONS/CPU_FREQ_OPTIONS в начале файла).
     loadRadioSettingsFromNVS();
 
-    // Пороги защиты от перегрева - та же логика, что и с мощностью/частотой выше: без сети защита
-    // должна работать с настройками оператора с самого первого тика проверки в
-    // updateOverheatProtection(), а не с дефолтами прошивки.
-    loadOverheatThresholdsFromNVS();
+    // Пороги включения/выключения вентилятора - та же логика, что и с мощностью/частотой выше: без сети
+    // управление вентилятором должно работать с настройками оператора с самого первого тика проверки в
+    // updateFanControl(), а не с дефолтами прошивки.
+    loadFanThresholdsFromNVS();
 
     WiFi.macAddress(myMac);
     Serial.print("Hub MAC: ");
@@ -1325,7 +1260,7 @@ void setup() {
     server.on("/api/status", HTTP_GET, handleApiStatus);
     server.on("/api/setTxPower", HTTP_POST, handleApiSetTxPower);
     server.on("/api/setCpuFreq", HTTP_POST, handleApiSetCpuFreq);
-    server.on("/api/setOverheatThresholds", HTTP_POST, handleApiSetOverheatThresholds);
+    server.on("/api/setFanThresholds", HTTP_POST, handleApiSetFanThresholds);
     server.begin();
     Serial.println("Веб-сервер запущен.");
 
@@ -1351,8 +1286,7 @@ void loop() {
     }
     updateApAutoOff();
     updateStatusLed();
-    updateOverheatProtection();
-    updateOverheatLed();
+    updateFanControl();
 
     server.handleClient();
 
@@ -1361,18 +1295,9 @@ void loop() {
     // incomingPacketQueue может быть nullptr, если её создание в setup()
     // не удалось (тогда радио и так не инициализировано - очередь просто
     // всегда пуста).
-    //
-    // Пока действует аварийное отключение по перегреву (radioOverheatShutdown, см.
-    // большой комментарий у tempTripC в начале файла) - очередь всё равно
-    // ВЫЧИЩАЕМ (чтобы она не переполнялась пока колбэк приёма продолжает класть
-    // пакеты в неё, ведь сама ESP-NOW аппаратно не выключалась, см. там же), но
-    // СОДЕРЖИМОЕ НЕ обрабатывается (processIncomingPacket() не вызывается) - именно
-    // это и значит "остановить всю радиосвязь" - Хаб никак не реагирует на трафик от
-    // узлов, хотя нижний уровень ESP-NOW всё ещё слушает эфир и кладёт пакеты в очередь.
     if (incomingPacketQueue != nullptr) {
         UniversalPacket incoming;
         while (xQueueReceive(incomingPacketQueue, &incoming, 0) == pdTRUE) {
-            if (radioOverheatShutdown) continue; // молча выбрасываем - радиосвязь остановлена
             processIncomingPacket(incoming);
         }
     }
