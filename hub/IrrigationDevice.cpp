@@ -30,4 +30,20 @@ void IrrigationDevice::appendJsonFields(String &json) const {
     json += ",\"hasFlowSensor\":" + String(hasFlowSensor);
     json += ",\"flowPulsesPerLiter\":" + String(flowPulsesPerLiter);
     json += ",\"totalWaterUsed\":" + String(lastTotalWaterUsed);
+
+    // Настройки автополива по каждому клапану (см. комментарий у valveSchedules в IrrigationDevice.h) -
+    // всегда все MAX_IRRIGATION_VALVES элементов массива, даже если реально на узле меньше
+    // клапанов (valveCount) - веб-страница сама отбрасывает лишние за пределами valveCount
+    // (тот же принцип, что и с строками клапанов в секции "Управление", см. WebPage.h).
+    // volumeL пересчитывается из хранимых десятых литра (volumeDl) обратно в литры с
+    // одним знаком после запятой - именно эта граница с веб-интерфейсом/HTTP - единственное место,
+    // где целочисленное хранение превращается в дробное число для отображения/редактирования.
+    json += ",\"valveSchedules\":[";
+    for (int v = 0; v < MAX_IRRIGATION_VALVES; v++) {
+        if (v > 0) json += ",";
+        json += "{\"intervalDays\":" + String(valveSchedules[v].intervalDays) +
+                ",\"volumeL\":" + String(valveSchedules[v].volumeDl / 10.0, 1) +
+                ",\"autoEnabled\":" + String(valveSchedules[v].autoEnabled ? "true" : "false") + "}";
+    }
+    json += "]";
 }

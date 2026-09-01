@@ -258,6 +258,46 @@ UniversalPacket txPacket;
 
 uint16_t lastPacketId = 0; // счётчик ИСХОДЯЩИХ пакетов Хаба
 
+// --- Подтверждение команд (ACK) с повторами ---
+// ESP-NOW не гарантирует доставку на уровне приложения - MSG_COMMAND может
+// потеряться в эфире по дороге к узлу, или узел может её получить и обработать, а ответный
+// MSG_ACK потеряться уже на обратном пути - без отслеживания этого События Оператор
+// никак не узнаёт, что команда так и не дошла/не применилась - было бы просто тихо
+// молчание.
+//
+// На каждое устройство отслеживается не более ОДНОЙ незавершённой команды сразу - этого
+// достаточно для реального сценария использования (оператор жмёт кнопку открыть/закрыть
+// конкретного клапана - очередная команда тому же устройству естественно отменяет ожидание
+// предыдущей).
+//
+// Повтор ВСЕГДА идёт с НОВЫМ packet_id (а не тем же самым) - если узел на самом
+// деле получил и обработал первую попытку (потерялся только ответный ACK), повтор с ТЕМ ЖЕ
+// packet_id узел отбросил бы как дубликат (см. isNewerPacketId() в GardenProtocol.h) - и новый ACK так
+// и не пришёл бы никогда.
+#define COMMAND_ACK_TIMEOUT_MS 1200UL // сколько ждём ACK, прежде чем считать попытку неудавшейся
+#define COMMAND_MAX_ATTEMPTS 3         // включая первую отправку - т.е. до 2 повторов
+
+struct PendingCommand {
+    bool waiting = false;      // ждём ли сейчас ACK от этого устройства
+    uint16_t packetId = 0;     // packet_id последней отправленной попытки - с ним сверяем acked_packet_id
+    uint8_t attempt = 0;       // номер текущей попытки, 1..COMMAND_MAX_ATTEMPTS
+    unsigned long sentAtMs = 0;
+    // Параметры команды - сохраняются, чтобы повторная отправка могла воспроизвести
+    // тот же пакет без участия вызывающего кода.
+    uint8_t targetValve = 0;
+    uint8_t action = 0;
+    uint8_t mode = 0;
+    uint16_t durationSec = 0;
+    uint16_t volumeL = 0;
+};
+
+// Одна запись на каждый слот таблицы устройств (индексируется тем же deviceIdx, что и
+// deviceManager.devices[]) - новая команда тому же устройству (см. sendCommand() ниже)
+// просто перезаписывает старую запись целиком - если ACK на ПРЕЖНЮЮ команду
+// всё же придёт позже, он уже не совпадёт с новым packetId и будет просто проигнорирован -
+// так и должно быть, оператор уже передумал.
+PendingCommand pendingCommands[MAX_DEVICES];
+
 WebServer server(80);
 
 DeviceManager deviceManager;
@@ -384,15 +424,15 @@ void sendHubAnnounce() {
                   txPacket.packet_id, (unsigned long) txPacket.payload.hub.epoch);
 }
 
-void sendCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uint8_t mode, uint16_t durationSec, uint16_t volumeL) {
-    if (!radioReady) {
-        Serial.println("ESP-NOW не инициализировано - команда не отправлена.");
-        return;
-    }
-    if (!deviceManager.isValid(deviceIdx)) {
-        Serial.println("Нет такого устройства (см. 'list')");
-        return;
-    }
+// Собирает и реально отправляет IrrigationCommand устройству deviceIdx - общая часть для
+// первой отправки (sendCommand() ниже) и повторных попыток при отсутствии ACK
+// (updatePendingCommands() ниже) - в обоих случаях нужен НОВЫЙ packet_id (см. большой
+// комментарий у PendingCommand выше, почему нельзя переиспользовать старый). Не проверяет
+// radioReady/isValid(deviceIdx) - это ответственность вызывающего кода (оба места вызова уже
+// проверяют их сами). Возвращает packet_id отправленного пакета - вызывающий код
+// сохраняет его в pendingCommands[], чтобы сверить с acked_packet_id.
+uint16_t transmitCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uint8_t mode,
+                          uint16_t durationSec, uint16_t volumeL) {
     prepareHeader(MSG_COMMAND, deviceManager.devices[deviceIdx]->mac);
     txPacket.payload.irrigation.command.target_valve = targetValve;
     txPacket.payload.irrigation.command.action = action;
@@ -408,6 +448,72 @@ void sendCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uint8_t mod
     Serial.print("Sent COMMAND to #"); Serial.print(deviceIdx);
     Serial.printf(" valve=%u action=%u mode=%u duration_sec=%u volume_l=%u (packet_id=%u)\n",
                   targetValve, action, mode, durationSec, volumeL, txPacket.packet_id);
+    return txPacket.packet_id;
+}
+
+// Публичная точка входа для отправки команды (Serial-команды open/volume/close, POST
+// /api/command) - отправляет первую попытку через transmitCommand() выше и заводит
+// новую запись в pendingCommands[deviceIdx] (затирая любую прежнюю незавершённую
+// запись для этого же устройства - см. большой комментарий у pendingCommands выше). Сам
+// ответ об успехе здесь НЕ возвращается - это асинхронно: дальнейшая судьба (повторы/
+// отказ) обрабатывается в фоне через updatePendingCommands()/processIncomingPacket() -
+// синхронное ожидание ACK прямо здесь заблокировало бы loop() (и обработку входящих ESP-NOW
+// пакетов, и весь server.handleClient() — то же правило без блокировок, что и у
+// handleApiSetConfig()/sendSetConfig() рядом).
+void sendCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uint8_t mode, uint16_t durationSec, uint16_t volumeL) {
+    if (!radioReady) {
+        Serial.println("ESP-NOW не инициализировано - команда не отправлена.");
+        return;
+    }
+    if (!deviceManager.isValid(deviceIdx)) {
+        Serial.println("Нет такого устройства (см. 'list')");
+        return;
+    }
+
+    uint16_t packetId = transmitCommand(deviceIdx, targetValve, action, mode, durationSec, volumeL);
+
+    PendingCommand &pending = pendingCommands[deviceIdx];
+    pending.waiting = true;
+    pending.packetId = packetId;
+    pending.attempt = 1;
+    pending.sentAtMs = millis();
+    pending.targetValve = targetValve;
+    pending.action = action;
+    pending.mode = mode;
+    pending.durationSec = durationSec;
+    pending.volumeL = volumeL;
+}
+
+// Вызывается каждую итерацию loop() - проверяет, не истек ли таймаут ожидания ACK для
+// какого-нибудь устройства - см. большой комментарий у PendingCommand в начале файла. Если
+// устройство тем временем было забыто/вытеснено из таблицы - просто снимаем ожидание без
+// повтора (deviceManager.devices[i]->mac в transmitCommand() иначе было бы разыменовать null-указатель).
+void updatePendingCommands() {
+    for (int i = 0; i < MAX_DEVICES; i++) {
+        PendingCommand &pending = pendingCommands[i];
+        if (!pending.waiting) continue;
+
+        if (!deviceManager.isValid(i)) {
+            pending.waiting = false; // устройство ушло из таблицы, повторять некому
+            continue;
+        }
+
+        if (millis() - pending.sentAtMs < COMMAND_ACK_TIMEOUT_MS) continue; // ещё не истёк
+
+        if (pending.attempt >= COMMAND_MAX_ATTEMPTS) {
+            Serial.printf("Устройство #%d не подтвердило команду за %d попыт(ку/ки) - прекращаю повторы, оператору стоит проверить связь/питание узла.\n",
+                          i, COMMAND_MAX_ATTEMPTS);
+            pending.waiting = false;
+            continue;
+        }
+
+        pending.attempt++;
+        Serial.printf("Нет ACK от #%d за %lu мс - повтор %d/%d.\n",
+                      i, COMMAND_ACK_TIMEOUT_MS, pending.attempt, COMMAND_MAX_ATTEMPTS);
+        pending.packetId = transmitCommand(i, pending.targetValve, pending.action, pending.mode,
+                                            pending.durationSec, pending.volumeL);
+        pending.sentAtMs = millis();
+    }
 }
 
 // Отправить MSG_SET_CONFIG конкретному устройству - желаемые valve_count/mode/has_flow_sensor/
@@ -501,6 +607,23 @@ void processIncomingPacket(const UniversalPacket &rxPacket) {
         AckData ack = rxPacket.payload.ack;
         Serial.printf("ACK от #%d: acked_packet_id=%u status=%u\n",
                       idx, ack.acked_packet_id, ack.status);
+
+        // Если это подтверждение команды, которую сейчас ждём (см. большой комментарий у
+        // PendingCommand в начале файла) - снимаем ожидание, дальнейшие повторы через
+        // updatePendingCommands() больше не нужны. Сверка ИМЕННО по packetId (а не просто
+        // "пришёл хоть какой-то ACK от этого устройства") нужна, чтобы запоздавший ACK на
+        // уже отменённую/перезаписанную более новой командой попытку не спутать с текущей.
+        PendingCommand &pending = pendingCommands[idx];
+        if (pending.waiting && ack.acked_packet_id == pending.packetId) {
+            pending.waiting = false;
+            if (ack.status != 0) {
+                // Явный отказ - не потеря пакета, а осознанное "не могу выполнить" (см.
+                // AckData.status в GardenProtocol.h) - повторами это не лечится, поэтому дальше не
+                // повторяем, а просто сообщаем оператору.
+                Serial.printf("Устройство #%d ОТКЛОНИЛО команду (status=%u) - повторы не помогут.\n",
+                              idx, ack.status);
+            }
+        }
         return;
     }
 
@@ -673,7 +796,17 @@ void updateFanControl() {
 // окне редактора, не засоряя логику в hub.ino огромным raw-string-литералом.
 
 void handleRoot() {
-    server.send(200, "text/html", INDEX_HTML);
+    // send() (в ОТЛИЧИЕ от send_P()) принимает третий аргумент как const String& - передача туда
+    // INDEX_HTML (сырой массив в flash, сейчас десятки КБ) заставила бы компилятор НЕЯВНО
+    // СКОПИРОВАТЬ весь массив в новый String на куче (нужен один НЕПРЕРЫВНЫЙ блок
+    // такого же размера). Если к этому моменту куча уже фрагментирована
+    // (WiFi/ESP-NOW/mDNS/Preferences уже что-то выделили) и одного такого блока не
+    // найдётся - выделение String тихо ПРОВАЛИВАЕТСЯ (без исключения), String остаётся
+    // пустым, и браузер получает 200 OK С ПУСТЫМ ТЕЛОМ - именно этот симптом и наблюдался.
+    // send_P() же никакой копии не делает - отдаёт содержимое прямо из flash через PGM_P
+    // (на ESP32 PROGMEM фактически no-op, flash отображается в адресное пространство, читать
+    // можно напрямую), без крупной аллокации на куче.
+    server.send_P(200, "text/html", INDEX_HTML);
 }
 
 // Экранирует строку для безопасной вставки в JSON-значение (кавычки,
@@ -836,6 +969,40 @@ void handleApiRename() {
     String name = server.arg("name");
     if (!deviceManager.setName(idx, name.c_str())) {
         server.send(404, "text/plain", "device not found or not installed");
+        return;
+    }
+    server.send(200, "text/plain", "ok");
+}
+
+// POST /api/setValveSchedule - form-urlencoded: idx, valve, intervalDays (1..7), volumeL (десятичное
+// число литров, точность до десятых), autoEnabled (0/1). Настройки автополива клапана -
+// В ОТЛИЧИЕ от /api/setConfig (уходит на узел через ESP-NOW) - эти настройки ПОЛНОСТЬЮ локальны
+// для Самого Хаба (сам автополив по расписанию пока НЕ РЕАЛИЗОВАН - см. большой комментарий у
+// ValveSchedule в IrrigationDevice.h) - только сохраняются в NVS (см. DeviceManager::setValveSchedule()),
+// ничего узлу не отправляется. Доступно ТОЛЬКО для уже установленного устройства (та же
+// причина, что и у /api/rename выше - у кандидата эти настройки бессмысленны, он может быть
+// в любой момент вытеснен). volumeL приходит от браузера как десятичное число с точкой
+// (например, "2.5") - здесь переводится в целочисленные десятые литра (×10, с округлением до
+// ближайшего целого) перед сохранением - см. комментарий у volumeDl в ValveSchedule (IrrigationDevice.h),
+// почему хранится именно так.
+void handleApiSetValveSchedule() {
+    if (!server.hasArg("idx") || !server.hasArg("valve") || !server.hasArg("intervalDays") ||
+        !server.hasArg("volumeL") || !server.hasArg("autoEnabled")) {
+        server.send(400, "text/plain", "missing idx, valve, intervalDays, volumeL or autoEnabled");
+        return;
+    }
+    int idx = server.arg("idx").toInt();
+    int valve = server.arg("valve").toInt();
+    int intervalDays = server.arg("intervalDays").toInt();
+    float volumeL = server.arg("volumeL").toFloat();
+    int autoEnabled = server.arg("autoEnabled").toInt();
+    if (intervalDays < 1 || intervalDays > 7 || volumeL < 0 || volumeL > 1000) {
+        server.send(400, "text/plain", "invalid intervalDays or volumeL");
+        return;
+    }
+    uint16_t volumeDl = (uint16_t) (volumeL * 10.0f + 0.5f); // округление до ближайшего целого, а не обрезание вниз
+    if (!deviceManager.setValveSchedule(idx, valve, (uint8_t) intervalDays, volumeDl, autoEnabled != 0)) {
+        server.send(404, "text/plain", "device not found, not installed, not irrigation, or invalid valve");
         return;
     }
     server.send(200, "text/plain", "ok");
@@ -1256,6 +1423,7 @@ void setup() {
     server.on("/api/install", HTTP_POST, handleApiInstall);
     server.on("/api/forget", HTTP_POST, handleApiForget);
     server.on("/api/rename", HTTP_POST, handleApiRename);
+    server.on("/api/setValveSchedule", HTTP_POST, handleApiSetValveSchedule);
     server.on("/api/settime", HTTP_POST, handleApiSetTime);
     server.on("/api/status", HTTP_GET, handleApiStatus);
     server.on("/api/setTxPower", HTTP_POST, handleApiSetTxPower);
@@ -1287,6 +1455,7 @@ void loop() {
     updateApAutoOff();
     updateStatusLed();
     updateFanControl();
+    updatePendingCommands();
 
     server.handleClient();
 

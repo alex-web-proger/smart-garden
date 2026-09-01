@@ -45,13 +45,29 @@ void DeviceManager::registerAt(int i, const uint8_t *mac, uint8_t deviceType) {
 }
 
 void DeviceManager::saveToNVS() {
-    InstalledDeviceRecord records[MAX_DEVICES];
+    // static, НЕ локальный массив на стеке - с добавлением valveSchedules в InstalledDeviceRecord каждая
+    // запись заметно выросла, а records[MAX_DEVICES] на стеке задачи loop() (8КБ по умолчанию на
+    // ESP32, общий со всем остальным, что делает loop()) рисковал бы переполнить его при install/
+    // rename/setValveSchedule (все вызывают saveToNVS()) - static кладёт массив в .bss вместо стека,
+    // цена - функция больше не реентрабельна (некритично — вызывается только из loop()-задачи,
+    // см. комментарий про "Однопоточность бизнес-логики" в hub.ino).
+    static InstalledDeviceRecord records[MAX_DEVICES];
     int count = 0;
     for (int i = 0; i < MAX_DEVICES; i++) {
         if (devices[i] != nullptr && devices[i]->installed) {
             memcpy(records[count].mac, devices[i]->mac, 6);
             records[count].deviceType = devices[i]->deviceType;
             memcpy(records[count].name, devices[i]->name, sizeof(records[count].name));
+            // Настройки автополива есть ТОЛЬКО у IrrigationDevice (см. комментарий у valveSchedules в
+            // InstalledDeviceRecord выше) - для остальных типов устройств просто зануляем блок - даункастинг
+            // на IrrigationDevice* безопасен, т.к. делается ТОЛЬКО после проверки deviceType (та же
+            // схема, что и в registerAt() выше - там DeviceManager тоже уже "знает" про IrrigationDevice конкретно).
+            if (devices[i]->deviceType == TYPE_IRRIGATION) {
+                IrrigationDevice *irr = static_cast<IrrigationDevice *>(devices[i]);
+                memcpy(records[count].valveSchedules, irr->valveSchedules, sizeof(records[count].valveSchedules));
+            } else {
+                memset(records[count].valveSchedules, 0, sizeof(records[count].valveSchedules));
+            }
             count++;
         }
     }
@@ -75,7 +91,10 @@ void DeviceManager::loadFromNVS() {
     int count = len / sizeof(InstalledDeviceRecord);
     if (count > MAX_DEVICES) count = MAX_DEVICES; // защита от повреждённых/чужих данных в NVS
 
-    InstalledDeviceRecord records[MAX_DEVICES];
+    // static - та же причина, что и у records в saveToNVS() выше (см. там комментарий) - здесь это
+    // важнее ещё и потому, что loadFromNVS() вызывается из setup() до того, как стек Wi-Fi/ESP-NOW
+    // успел нарастить своё потребление стека от других локальных переменных.
+    static InstalledDeviceRecord records[MAX_DEVICES];
     prefs.getBytes(NVS_KEY_DEVICES, records, count * sizeof(InstalledDeviceRecord));
     prefs.end();
 
@@ -83,6 +102,13 @@ void DeviceManager::loadFromNVS() {
         registerAt(i, records[i].mac, records[i].deviceType);
         devices[i]->installed = true;
         memcpy(devices[i]->name, records[i].name, sizeof(devices[i]->name));
+        // Симметрично saveToNVS() выше - настройки автополива восстанавливаются ТОЛЬКО для
+        // только что созданного registerAt() IrrigationDevice - для прочих типов в записи всё равно
+        // только занулённые байты (см. saveToNVS()).
+        if (records[i].deviceType == TYPE_IRRIGATION) {
+            IrrigationDevice *irr = static_cast<IrrigationDevice *>(devices[i]);
+            memcpy(irr->valveSchedules, records[i].valveSchedules, sizeof(irr->valveSchedules));
+        }
     }
     Serial.printf("Восстановлено из NVS: %d установленных устройств\n", count);
 }
@@ -154,6 +180,21 @@ bool DeviceManager::setName(int idx, const char *newName) {
     if (newName == nullptr) newName = "";
     strncpy(devices[idx]->name, newName, DEVICE_NAME_MAX_LEN - 1);
     devices[idx]->name[DEVICE_NAME_MAX_LEN - 1] = '\0';
+    saveToNVS();
+    return true;
+}
+
+bool DeviceManager::setValveSchedule(int idx, int valve, uint8_t intervalDays, uint16_t volumeDl, bool autoEnabled) {
+    if (!isValid(idx) || !devices[idx]->installed) return false;
+    if (devices[idx]->deviceType != TYPE_IRRIGATION) return false;
+    if (valve < 1 || valve > MAX_IRRIGATION_VALVES) return false;
+    if (intervalDays < 1 || intervalDays > 7) return false;
+
+    IrrigationDevice *irr = static_cast<IrrigationDevice *>(devices[idx]);
+    ValveSchedule &sched = irr->valveSchedules[valve - 1];
+    sched.intervalDays = intervalDays;
+    sched.volumeDl = volumeDl;
+    sched.autoEnabled = autoEnabled ? 1 : 0;
     saveToNVS();
     return true;
 }

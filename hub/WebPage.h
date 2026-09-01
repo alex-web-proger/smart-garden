@@ -19,12 +19,24 @@
 //
 // КОНФИГУРАЦИЯ МОДУЛЯ: /api/devices отдаёт реальные valveCount/mode/hasFlowSensor/
 // flowPulsesPerLiter/totalWaterUsed узла (см. IrrigationDevice в hub/IrrigationDevice.h) - раздел
-// "Управление" в модальном окне рисует РОВНО столько клапанов, сколько сейчас
+// "Управление" в модальном окне (сворачиваемый, по умолчанию закрыт, такой же
+// <details>/<summary>, как и у "Конфигурации модуля" ниже) рисует РОВНО столько клапанов, сколько сейчас
 // сконфигурировано на самом узле (0, пока первый MSG_CONFIG от него ещё не пришёл -
 // тогда секция клапанов временно пуста), а при hasFlowSensor==true ещё и накопленный
 // объём воды с момента последнего сброса узла (сам датчик ещё не реализован узлом, см.
-// TODO у fillTelemetry() в flow_node.ino - пока всегда 0). Тут же, ниже - сектор "Конфигурация
-// модуля" (сворачиваемый, по умолчанию закрыт, <details>/<summary>) с количеством
+// TODO у fillTelemetry() в flow_node.ino - пока всегда 0). Перед ним, выше - НЕ сворачиваемая
+// секция "Настройка" (id="modal-settings-section") - по одному блоку на каждый клапан (в
+// пределах текущего valveCount) с тремя полями: периодичность полива (выпадающий список
+// "Раз в N дней", 1..7), объём за один полив в литрах (до десятых) и чекбокс "Автополив
+// включён". В ОТЛИЧИЕ от "Конфигурации модуля" ниже, эти настройки ПОЛНОСТЬЮ локальны для
+// Хаба и НЕ отправляются узлу по ESP-NOW вообще - только сохраняются в NVS САМОГО ХАБА
+// (POST /api/setValveSchedule -> DeviceManager::setValveSchedule(), см. hub.ino/DeviceManager.h/.cpp
+// и большой комментарий у ValveSchedule в hub/IrrigationDevice.h) - сам автополив по расписанию
+// (то есть фактическая периодическая отправка MSG_COMMAND) пока НЕ РЕАЛИЗОВАН, эти поля пока
+// только хранятся и готовы к будущему планировщику. У каждого клапана своя кнопка "Сохранить" -
+// изменения по разным клапанам применяются независимо. Тут же, ниже самого
+// "Управления" - сектор "Конфигурация
+// модуля" (также сворачиваемый, по умолчанию закрыт, <details>/<summary>) с количеством
 // каналов (1-5), режимом работы (1/2), наличием датчика потока (чекбокс) и его
 // разрешением (импульсов на литр) - изменения уходят на
 // Хаб через POST /api/setConfig, который отправляет узлу MSG_SET_CONFIG; узел сам
@@ -144,7 +156,19 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .modal-actions { margin:14px 0 4px; display:flex; gap:8px; flex-wrap:wrap; }
 
   .valve-section { margin-top:14px; border-top:1px solid #eee; padding-top:12px; }
-  .valve-section h3 { font-size:0.9em; margin:0 0 8px; }
+  .valve-section summary { font-size:0.9em; margin:0 0 8px; cursor:pointer; font-weight:600; }
+  .valve-section[open] summary { margin-bottom:8px; }
+
+  .settings-section { margin-top:14px; border-top:1px solid #eee; padding-top:12px; }
+  .settings-section h3 { font-size:0.9em; margin:0 0 8px; }
+  /* Один блок настроек автополива на клапан внутри секции "Настройка" - тот же принцип
+     разделительных полосок между блоками, что и у .valve-row (см. ниже), но здесь блок
+     МНОГОСТРОЧНЫЙ (три поля + кнопка "Сохранить"), а не одна строка. */
+  .schedule-row { padding:8px 0 4px; border-bottom:1px solid #f2f2f2; }
+  .schedule-row:last-child { border-bottom:none; }
+  .schedule-row-title { font-weight:600; font-size:0.85em; margin-bottom:6px; }
+  .schedule-row .config-row { margin-bottom:6px; }
+  .schedule-row button.apply-btn { margin-top:2px; }
   .duration-row { font-size:0.85em; margin-bottom:10px; display:flex; align-items:center; gap:8px; }
   .duration-row input { width:60px; padding:4px; border:1px solid #ccc; border-radius:4px; }
   .valve-row { display:flex; align-items:center; justify-content:space-between; gap:8px;
@@ -540,6 +564,43 @@ function buildIrrigationTypeSpecific(d) {
   const existingDuration = document.getElementById('modal-duration');
   const durationValue = existingDuration ? existingDuration.value : 10;
 
+  // Строки настроек автополива по каждому клапану - d.valveSchedules всегда массив из
+  // MAX_IRRIGATION_VALVES элементов от Хаба (см. IrrigationDevice::appendJsonFields() в hub/IrrigationDevice.cpp),
+  // здесь берётся только первые d.valveCount из них - тот же принцип, что и у строк клапанов в
+  // секции "Управление" выше. При пересборке (needsRebuild в updateModal()) текущие
+  // значения в полях (если они уже есть в DOM) сохраняются - тот же принцип, что и у
+  // modal-cfg-* ниже, чтобы случайная пересборка (например, из-за смены hasFlowSensor) не стерла
+  // несохранённый ввод оператора.
+  let scheduleRows = '';
+  for (let v = 1; v <= d.valveCount; v++) {
+    const sched = (d.valveSchedules && d.valveSchedules[v - 1]) || { intervalDays: 1, volumeL: 0, autoEnabled: false };
+
+    const existingInterval = document.getElementById('schedule-interval-' + v);
+    const intervalValue = existingInterval ? existingInterval.value : sched.intervalDays;
+    const existingVolume = document.getElementById('schedule-volume-' + v);
+    const volumeValue = existingVolume ? existingVolume.value : sched.volumeL.toFixed(1);
+    const existingAuto = document.getElementById('schedule-auto-' + v);
+    const autoChecked = existingAuto ? existingAuto.checked : !!sched.autoEnabled;
+
+    scheduleRows +=
+      '<div class="schedule-row" id="schedule-row-' + v + '">' +
+        '<div class="schedule-row-title">Клапан ' + v + '</div>' +
+        '<div class="config-row">' +
+          '<label for="schedule-interval-' + v + '">Периодичность полива</label>' +
+          '<select id="schedule-interval-' + v + '">' + intervalDaysOptions(intervalValue) + '</select>' +
+        '</div>' +
+        '<div class="config-row">' +
+          '<label for="schedule-volume-' + v + '">Объём, л</label>' +
+          '<input type="number" min="0" step="0.1" id="schedule-volume-' + v + '" value="' + volumeValue + '">' +
+        '</div>' +
+        '<div class="config-row">' +
+          '<label for="schedule-auto-' + v + '">Автополив включён</label>' +
+          '<input type="checkbox" id="schedule-auto-' + v + '"' + (autoChecked ? ' checked' : '') + '>' +
+        '</div>' +
+        '<button class="apply-btn" onclick="saveValveSchedule(this, ' + d.idx + ', ' + v + ')">Сохранить</button>' +
+      '</div>';
+  }
+
   const existingCfgValves = document.getElementById('modal-cfg-valves');
   const cfgValvesValue = existingCfgValves ? existingCfgValves.value : (d.valveCount || 4);
   const existingCfgMode = document.getElementById('modal-cfg-mode');
@@ -550,8 +611,24 @@ function buildIrrigationTypeSpecific(d) {
   const cfgPulsesValue = existingCfgPulses ? existingCfgPulses.value : (d.flowPulsesPerLiter || 450);
 
   typeSpecific.innerHTML =
-    '<div class="valve-section">' +
-      '<h3>Управление</h3>' +
+    // Настройки автополива по каждому клапану (периодичность/объём/вкл-выкл) - хранятся в NVS
+    // Самого Хаба (см. DeviceManager::setValveSchedule()) и НЕ отправляются узлу - сам
+    // автополив по расписанию пока не реализован (см. большой комментарий у ValveSchedule в hub/IrrigationDevice.h).
+    // Не сворачиваемая (в отличие от "Управления" ниже) - настройки автополива задаются редко
+    // и сами по себе не такие громоздкие, как список клапанов в "Управлении".
+    '<div class="settings-section" id="modal-settings-section">' +
+      '<h3>Настройка</h3>' +
+      (d.valveCount > 0
+        ? scheduleRows
+        : '<span style="color:#999;font-size:0.85em;">Ожидание конфигурации от устройства...</span>') +
+    '</div>' +
+    // Сворачиваемая (<details>/<summary>, тот же паттерн, что и у "Конфигурации модуля"
+    // ниже) - по умолчанию свёрнута (атрибут open не проставлен): это самая часто
+    // используемая часть модалки, но открытые клапаны и так видны точечным
+    // обновлением на карточке/в других местах, а при частом открытии модалки на разных
+    // устройствах свёрнутое по умолчанию состояние меньше загромождает окно.
+    '<details class="valve-section">' +
+      '<summary>Управление</summary>' +
       (d.hasFlowSensor
         ? '<div class="modal-field"><span>Израсходовано воды</span><b id="modal-water-used">—</b></div>'
         : '') +
@@ -563,7 +640,7 @@ function buildIrrigationTypeSpecific(d) {
            '<div id="modal-mode-hint" style="font-size:0.75em;color:#999;margin:-6px 0 8px;"></div>' +
            rows)
         : '<span style="color:#999;font-size:0.85em;">Ожидание конфигурации от устройства...</span>') +
-    '</div>' +
+    '</details>' +
     '<details class="config-section">' +
       '<summary>Конфигурация модуля</summary>' +
       '<div class="config-row">' +
@@ -676,6 +753,51 @@ async function saveModuleConfig(btn, idx) {
     flashButton(btn, res.ok ? '✓ Отправлено' : '✗ Ошибка', res.ok);
   } catch (e) {
     flashButton(btn, '✗ Ошибка', false);
+  }
+  setTimeout(refresh, 300);
+}
+
+// Склоняемое русского существительного после числа ("N день/дня/дней") - используется только
+// в intervalDaysOptions() ниже, для диапазона 1..7 возможных значений периодичности полива
+// (см. IntervalDays в ValveSchedule, hub/IrrigationDevice.h).
+function intervalDaysWord(n) {
+  if (n === 1) return 'день';
+  if (n >= 2 && n <= 4) return 'дня';
+  return 'дней';
+}
+
+// Строит набор <option> для выпадающего списка периодичности полива (1..7 дней, см.
+// секцию "Настройка" в buildIrrigationTypeSpecific()) - selected может прийти как числом,
+// так и строкой (от уже существующего <select>.value) - нестрогое сравнение (==) ниже
+// специально ради этого.
+function intervalDaysOptions(selected) {
+  let opts = '';
+  for (let n = 1; n <= 7; n++) {
+    opts += '<option value="' + n + '"' + (n == selected ? ' selected' : '') + '>' +
+            'Раз в ' + n + ' ' + intervalDaysWord(n) + '</option>';
+  }
+  return opts;
+}
+
+// Сохраняет настройки автополива одного клапана из секции "Настройка" (POST /api/setValveSchedule -
+// чисто хабовая настройка, см. handleApiSetValveSchedule() в hub.ino - в ОТЛИЧИЕ от saveModuleConfig()
+// ниже НИЧЕГО не отправляется узлу, поэтому результат применяется/подтверждается
+// СРАЗУ, без ожидания асинхронного ответа от узла). Отдельная кнопка на каждый клапан (а не
+// одна общая на всю секцию) - оператор может править и сохранять каждую линию независимо.
+async function saveValveSchedule(btn, idx, valve) {
+  const interval = document.getElementById('schedule-interval-' + valve).value;
+  const volume = document.getElementById('schedule-volume-' + valve).value;
+  const autoEnabled = document.getElementById('schedule-auto-' + valve).checked ? 1 : 0;
+  try {
+    const res = await fetch('/api/setValveSchedule', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'idx=' + idx + '&valve=' + valve + '&intervalDays=' + interval +
+            '&volumeL=' + volume + '&autoEnabled=' + autoEnabled
+    });
+    flashButton(btn, res.ok ? '✓' : '✗', res.ok);
+  } catch (e) {
+    flashButton(btn, '✗', false);
   }
   setTimeout(refresh, 300);
 }
