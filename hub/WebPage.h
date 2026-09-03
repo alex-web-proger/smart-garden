@@ -24,7 +24,14 @@
 // сконфигурировано на самом узле (0, пока первый MSG_CONFIG от него ещё не пришёл -
 // тогда секция клапанов временно пуста), а при hasFlowSensor==true ещё и накопленный
 // объём воды с момента последнего сброса узла (сам датчик ещё не реализован узлом, см.
-// TODO у fillTelemetry() в flow_node.ino - пока всегда 0). Перед ним, выше - НЕ сворачиваемая
+// TODO у fillTelemetry() в flow_node.ino - пока всегда 0). Открытие клапана поддерживает ТРИ режима
+// (переключатель "Режим открытия" в самом верху секции "Управление"): по времени
+// (mode=0, секунды), легаси по целым литрам (mode=1, НЕ реализован на узле) и ТРЕТИЙ - точная
+// дозировка объёма с точностью до 0.1 л (mode=2, РЕАЛИЗОВАН на узле, см. checkDosing() в
+// flow_node.ino) - опция дозировки задизьюнена в выпадающем списке, если у узла нет
+// датчика потока (hasFlowSensor==false), и ВСЕГДА открывает ровно один клапан, форсированно
+// закрывая остальные (см. onCommand() в flow_node.ino) - независимо от режима 1/2 в
+// "Конфигурации модуля" ниже. Перед ним, выше - НЕ сворачиваемая
 // секция "Настройка" (id="modal-settings-section") - по одному блоку на каждый клапан (в
 // пределах текущего valveCount) с тремя полями: периодичность полива (выпадающий список
 // "Раз в N дней", 1..7), объём за один полив в литрах (до десятых) и чекбокс "Автополив
@@ -563,6 +570,12 @@ function buildIrrigationTypeSpecific(d) {
 
   const existingDuration = document.getElementById('modal-duration');
   const durationValue = existingDuration ? existingDuration.value : 10;
+  // Третий режим открытия (точная дозировка, mode=2) - тот же принцип сохранения
+  // текущего значения при пересборке, что и у durationValue выше.
+  const existingOpenMode = document.getElementById('modal-open-mode');
+  const openModeValue = existingOpenMode ? existingOpenMode.value : '0';
+  const existingDoseVolume = document.getElementById('modal-dose-volume');
+  const doseVolumeValue = existingDoseVolume ? existingDoseVolume.value : '1.0';
 
   // Строки настроек автополива по каждому клапану - d.valveSchedules всегда массив из
   // MAX_IRRIGATION_VALVES элементов от Хаба (см. IrrigationDevice::appendJsonFields() в hub/IrrigationDevice.cpp),
@@ -634,9 +647,29 @@ function buildIrrigationTypeSpecific(d) {
         : '') +
       (d.valveCount > 0
         ? ('<div class="duration-row">' +
+             '<label for="modal-open-mode">Режим открытия:</label>' +
+             '<select id="modal-open-mode" onchange="updateOpenModeVisibility()">' +
+               '<option value="0"' + (openModeValue == '0' ? ' selected' : '') + '>По времени</option>' +
+               '<option value="2"' + (openModeValue == '2' ? ' selected' : '') + (d.hasFlowSensor ? '' : ' disabled') + '>Точный объём (0.1 л)</option>' +
+             '</select>' +
+           '</div>' +
+           // Два отдельных ряда (вместо одного общего поля) - проще, чем переключать
+           // тип/шаг/мин одного <input> на лету. Начальная видимость задаётся инлайн стилем
+           // по openModeValue (при первом построении или пересборке), дальше её переключает
+           // updateOpenModeVisibility() по onchange выше, не трогая значения полей.
+           '<div class="duration-row" id="modal-duration-row"' + (openModeValue == '2' ? ' style="display:none;"' : '') + '>' +
              '<label for="modal-duration">Длительность открытия, сек:</label>' +
              '<input type="number" min="1" id="modal-duration" value="' + durationValue + '">' +
            '</div>' +
+           '<div class="duration-row" id="modal-dose-row"' + (openModeValue == '2' ? '' : ' style="display:none;"') + '>' +
+             '<label for="modal-dose-volume">Объём, л:</label>' +
+             '<input type="number" min="0.1" step="0.1" id="modal-dose-volume" value="' + doseVolumeValue + '">' +
+           '</div>' +
+           (d.hasFlowSensor
+             ? ''
+             // Без датчика потока точная дозировка невозможна - опция выше уже задизьюнена (disabled),
+             // эта подсказка объясняет почему.
+             : '<div class="config-hint">Точная дозировка требует датчика потока (см. «Конфигурация модуля»).</div>') +
            '<div id="modal-mode-hint" style="font-size:0.75em;color:#999;margin:-6px 0 8px;"></div>' +
            rows)
         : '<span style="color:#999;font-size:0.85em;">Ожидание конфигурации от устройства...</span>') +
@@ -710,13 +743,42 @@ function valveButtonClick(idx, valve, wasOpen) {
     // Закрываем ТОЛЬКО этот конкретный клапан (не все сразу) - корректно
     // работает в обоих режимах: в режиме 1 это и так был единственный открытый
     // клапан, в режиме 2 - останутся открытыми, как и должно быть при независимом
-    // управлении.
+    // управлении. Также отменяет текущее дозирование этого клапана, если оно было
+    // запущено (см. onCommand() в flow_node.ino).
     sendCmd(idx, valve, 1, 0, 0, 0);
+    return;
+  }
+
+  // Третий режим открытия (точная дозировка, mode=2) выбирается через #modal-open-mode
+  // (см. buildIrrigationTypeSpecific() выше) - при его отсутствии в DOM (ещё не пришла конфигурация
+  // от узла, valveCount==0) всегда падаем на mode=0 (по времени).
+  const openModeInput = document.getElementById('modal-open-mode');
+  const openMode = openModeInput ? openModeInput.value : '0';
+
+  if (openMode === '2') {
+    // volume теперь дробное (например "2.5") - бэкенд (handleApiCommand() в hub.ino) сам
+    // округлит его до десятых литра (volume_dl) - см. комментарий там.
+    const doseInput = document.getElementById('modal-dose-volume');
+    const liters = doseInput ? (doseInput.value || '1.0') : '1.0';
+    sendCmd(idx, valve, 0, 2, 0, liters);
   } else {
     const durationInput = document.getElementById('modal-duration');
     const sec = durationInput ? (durationInput.value || 10) : 10;
     sendCmd(idx, valve, 0, 0, sec, 0);
   }
+}
+
+// Переключает видимость #modal-duration-row/#modal-dose-row по текущему значению
+// #modal-open-mode (onchange в buildIrrigationTypeSpecific() выше) - чисто визуальное
+// переключение, никаких сетевых запросов здесь нет.
+function updateOpenModeVisibility() {
+  const openModeInput = document.getElementById('modal-open-mode');
+  const durationRow = document.getElementById('modal-duration-row');
+  const doseRow = document.getElementById('modal-dose-row');
+  if (!openModeInput || !durationRow || !doseRow) return;
+  const isDose = openModeInput.value === '2';
+  durationRow.style.display = isDose ? 'none' : '';
+  doseRow.style.display = isDose ? '' : 'none';
 }
 
 async function sendCmd(idx, valve, action, mode, duration, volume) {

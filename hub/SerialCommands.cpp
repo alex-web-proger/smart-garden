@@ -13,7 +13,7 @@ extern float fanOffTempC;  // порог выключения - там же
 extern bool fanOn;         // текущее состояние вентилятора - там же
 extern String currentTimeString();
 extern void sendCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uint8_t mode,
-                         uint16_t durationSec, uint16_t volumeL);
+                         uint16_t durationSec, uint16_t volumeL, uint16_t volumeDl);
 extern void sendSetConfig(int deviceIdx, uint8_t valveCount, uint8_t mode, uint8_t hasFlowSensor, uint16_t pulsesPerLiter);
 
 // Список доступных команд - одна строка на команду, вынесена в отдельную
@@ -26,6 +26,10 @@ extern void sendSetConfig(int deviceIdx, uint8_t valveCount, uint8_t mode, uint8
 //                                    автоматически закроет другие клапаны этого устройства, в режиме 2
 //                                    (независимый) - нет, см. IrrigationSpec.mode в GardenProtocol.h.
 //   volume <idx> <valve> <liters> - открыть клапан на N литров (mode=1), та же оговорка про режимы
+//   dose <idx> <valve> <liters>   - ТРЕТИЙ РЕЖИМ: точная дозировка объёма с точностью до 0.1 л (mode=2,
+//                                    РЕАЛИЗОВАНА на узле, см. checkDosing() в flow_node.ino) - требует настроенного
+//                                    датчика потока (config ... hasFlowSensor=1), всегда ФОРСИРОВАННО открывает
+//                                    РОВНО ОДИН клапан, закрывая остальные, <liters> дробное (например "2.5")
 //   close <idx> [valve]           - закрыть один конкретный клапан (если указан) или все сразу
 //                                    (без valve) - работает одинаково в обоих режимах
 //   config <idx> <valves> <mode> <hasFlowSensor> <pulsesPerLiter>
@@ -33,7 +37,7 @@ extern void sendSetConfig(int deviceIdx, uint8_t valveCount, uint8_t mode, uint8
 //                                    работы (1 - эксклюзивный, 2 - независимый), наличие
 //                                    датчика потока (0|1) и его разрешение (импульсов на
 //                                    литр, 1..20000) - хранится НА САМОМ узле (EEPROM),
-//                                    переживает его перезагрузку, в отличие от open/volume/close
+//                                    переживает его перезагрузку, в отличие от open/volume/dose/close
 //   install <idx>                 - подтвердить устройство, защитить от вытеснения, сохранить в NVS
 //   forget <idx>                  - удалить устройство (установленное или нет) из таблицы и NVS
 //   rename <idx> <name>           - переименовать установленное устройство, сохранить в NVS
@@ -46,7 +50,8 @@ void printHelp() {
     Serial.println("Доступные команды:");
     Serial.println("  list                          - показать известные устройства");
     Serial.println("  open <idx> <valve> <sec>      - открыть клапан на N секунд");
-    Serial.println("  volume <idx> <valve> <liters> - открыть клапан на N литров");
+    Serial.println("  volume <idx> <valve> <liters> - открыть клапан на N литров (целых, не реализовано)");
+    Serial.println("  dose <idx> <valve> <liters>   - точная дозировка, открывает РОВНО один клапан (требует датчик потока)");
     Serial.println("  close <idx> [valve]           - закрыть клапан (все, если valve не указан)");
     Serial.println("  config <idx> <valves> <mode> <hasFlowSensor> <pulsesPerLiter>");
     Serial.println("                                 - задать конфигурацию устройства (сохраняется на узле)");
@@ -70,16 +75,28 @@ void handleSerialCommand(String line) {
     } else if (cmd == "open") {
         int idx, valve, sec;
         if (sscanf(line.c_str(), "open %d %d %d", &idx, &valve, &sec) == 3) {
-            sendCommand(idx, valve, ACTION_OPEN, /*mode=*/0, /*duration_sec=*/sec, /*volume_l=*/0);
+            sendCommand(idx, valve, ACTION_OPEN, /*mode=*/0, /*duration_sec=*/sec, /*volume_l=*/0, /*volume_dl=*/0);
         } else {
             Serial.println("Использование: open <idx> <valve> <sec>");
         }
     } else if (cmd == "volume") {
         int idx, valve, liters;
         if (sscanf(line.c_str(), "volume %d %d %d", &idx, &valve, &liters) == 3) {
-            sendCommand(idx, valve, ACTION_OPEN, /*mode=*/1, /*duration_sec=*/0, /*volume_l=*/liters);
+            sendCommand(idx, valve, ACTION_OPEN, /*mode=*/1, /*duration_sec=*/0, /*volume_l=*/liters, /*volume_dl=*/0);
         } else {
             Serial.println("Использование: volume <idx> <valve> <liters>");
+        }
+    } else if (cmd == "dose") {
+        // Третий режим (mode=2) - точная дозировка с точностью до десятых литра -
+        // <liters> разбирается как float (например "2.5"), тут же округляется до десятых
+        // литра - точно так же, как handleApiCommand() в hub.ino делает это для POST /api/command.
+        int idx, valve;
+        float liters;
+        if (sscanf(line.c_str(), "dose %d %d %f", &idx, &valve, &liters) == 3) {
+            uint16_t volumeDl = (uint16_t) (liters * 10.0f + 0.5f);
+            sendCommand(idx, valve, ACTION_OPEN, /*mode=*/2, /*duration_sec=*/0, /*volume_l=*/0, volumeDl);
+        } else {
+            Serial.println("Использование: dose <idx> <valve> <liters>");
         }
     } else if (cmd == "close") {
         // Второй аргумент опционален - сначала пробуем разобрать с ним и только
@@ -87,9 +104,9 @@ void handleSerialCommand(String line) {
         // GardenProtocol.h).
         int idx, valve;
         if (sscanf(line.c_str(), "close %d %d", &idx, &valve) == 2) {
-            sendCommand(idx, valve, ACTION_CLOSE, /*mode=*/0, /*duration_sec=*/0, /*volume_l=*/0);
+            sendCommand(idx, valve, ACTION_CLOSE, /*mode=*/0, /*duration_sec=*/0, /*volume_l=*/0, /*volume_dl=*/0);
         } else if (sscanf(line.c_str(), "close %d", &idx) == 1) {
-            sendCommand(idx, /*target_valve=*/0, ACTION_CLOSE, /*mode=*/0, /*duration_sec=*/0, /*volume_l=*/0);
+            sendCommand(idx, /*target_valve=*/0, ACTION_CLOSE, /*mode=*/0, /*duration_sec=*/0, /*volume_l=*/0, /*volume_dl=*/0);
         } else {
             Serial.println("Использование: close <idx> [valve]");
         }

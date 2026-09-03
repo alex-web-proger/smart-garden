@@ -289,6 +289,7 @@ struct PendingCommand {
     uint8_t mode = 0;
     uint16_t durationSec = 0;
     uint16_t volumeL = 0;
+    uint16_t volumeDl = 0; // целевой объём в десятых литра для mode=2 (точная дозировка, см. IrrigationCommand.volume_dl в GardenProtocol.h)
 };
 
 // Одна запись на каждый слот таблицы устройств (индексируется тем же deviceIdx, что и
@@ -432,13 +433,14 @@ void sendHubAnnounce() {
 // проверяют их сами). Возвращает packet_id отправленного пакета - вызывающий код
 // сохраняет его в pendingCommands[], чтобы сверить с acked_packet_id.
 uint16_t transmitCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uint8_t mode,
-                          uint16_t durationSec, uint16_t volumeL) {
+                          uint16_t durationSec, uint16_t volumeL, uint16_t volumeDl) {
     prepareHeader(MSG_COMMAND, deviceManager.devices[deviceIdx]->mac);
     txPacket.payload.irrigation.command.target_valve = targetValve;
     txPacket.payload.irrigation.command.action = action;
     txPacket.payload.irrigation.command.mode = mode;
     txPacket.payload.irrigation.command.duration_sec = durationSec;
     txPacket.payload.irrigation.command.volume_l = volumeL;
+    txPacket.payload.irrigation.command.volume_dl = volumeDl;
 
     esp_err_t result = esp_now_send(BROADCAST_MAC, (uint8_t *) &txPacket, sizeof(txPacket));
     if (result != ESP_OK) {
@@ -446,8 +448,8 @@ uint16_t transmitCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uin
     }
 
     Serial.print("Sent COMMAND to #"); Serial.print(deviceIdx);
-    Serial.printf(" valve=%u action=%u mode=%u duration_sec=%u volume_l=%u (packet_id=%u)\n",
-                  targetValve, action, mode, durationSec, volumeL, txPacket.packet_id);
+    Serial.printf(" valve=%u action=%u mode=%u duration_sec=%u volume_l=%u volume_dl=%u (packet_id=%u)\n",
+                  targetValve, action, mode, durationSec, volumeL, volumeDl, txPacket.packet_id);
     return txPacket.packet_id;
 }
 
@@ -460,7 +462,7 @@ uint16_t transmitCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uin
 // синхронное ожидание ACK прямо здесь заблокировало бы loop() (и обработку входящих ESP-NOW
 // пакетов, и весь server.handleClient() — то же правило без блокировок, что и у
 // handleApiSetConfig()/sendSetConfig() рядом).
-void sendCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uint8_t mode, uint16_t durationSec, uint16_t volumeL) {
+void sendCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uint8_t mode, uint16_t durationSec, uint16_t volumeL, uint16_t volumeDl) {
     if (!radioReady) {
         Serial.println("ESP-NOW не инициализировано - команда не отправлена.");
         return;
@@ -470,7 +472,7 @@ void sendCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uint8_t mod
         return;
     }
 
-    uint16_t packetId = transmitCommand(deviceIdx, targetValve, action, mode, durationSec, volumeL);
+    uint16_t packetId = transmitCommand(deviceIdx, targetValve, action, mode, durationSec, volumeL, volumeDl);
 
     PendingCommand &pending = pendingCommands[deviceIdx];
     pending.waiting = true;
@@ -482,6 +484,7 @@ void sendCommand(int deviceIdx, uint8_t targetValve, uint8_t action, uint8_t mod
     pending.mode = mode;
     pending.durationSec = durationSec;
     pending.volumeL = volumeL;
+    pending.volumeDl = volumeDl;
 }
 
 // Вызывается каждую итерацию loop() - проверяет, не истек ли таймаут ожидания ACK для
@@ -511,7 +514,7 @@ void updatePendingCommands() {
         Serial.printf("Нет ACK от #%d за %lu мс - повтор %d/%d.\n",
                       i, COMMAND_ACK_TIMEOUT_MS, pending.attempt, COMMAND_MAX_ATTEMPTS);
         pending.packetId = transmitCommand(i, pending.targetValve, pending.action, pending.mode,
-                                            pending.durationSec, pending.volumeL);
+                                            pending.durationSec, pending.volumeL, pending.volumeDl);
         pending.sentAtMs = millis();
     }
 }
@@ -877,9 +880,16 @@ void handleApiDevices() {
 // action - ValveAction (0=ACTION_OPEN, 1=ACTION_CLOSE, см. GardenProtocol.h) - по умолчанию
 // ACTION_OPEN для обратной совместимости с вызовами без этого поля (веб-страница
 // всегда отправляет его явно, см. WebPage.h). Ровно то же самое, что делают Serial-команды
-// open/volume/close - просто другой вход в ту же sendCommand(). Работает и для
+// open/volume/dose/close - просто другой вход в ту же sendCommand(). Работает и для
 // не-установленных кандидатов - можно проверить/опознать устройство физически
 // (например, подёргать клапан) ДО того, как решить его устанавливать.
+//
+// "volume" теперь десятичное (например "2.5"), а не целое - чтобы одно и то же поле
+// веб-формы работало и для легаси mode=1 (целые литры), и для нового mode=2 (точная
+// дозировка с точностью до 0.1 л) - здесь считаются СРАЗУ и volumeL (округление до
+// целого литра), и volumeDl (округление до десятых литра) - точно так же, как уже
+// делается для ValveSchedule.volumeDl в handleApiSetValveSchedule() ниже - узел сам возьмёт из
+// команды только то поле, которое соответствует его mode (см. onCommand() в flow_node.ino).
 void handleApiCommand() {
     if (!server.hasArg("idx")) {
         server.send(400, "text/plain", "missing idx");
@@ -890,9 +900,11 @@ void handleApiCommand() {
     int action = server.hasArg("action") ? server.arg("action").toInt() : ACTION_OPEN;
     int mode = server.hasArg("mode") ? server.arg("mode").toInt() : 0;
     int duration = server.hasArg("duration") ? server.arg("duration").toInt() : 0;
-    int volume = server.hasArg("volume") ? server.arg("volume").toInt() : 0;
+    float volumeF = server.hasArg("volume") ? server.arg("volume").toFloat() : 0.0f;
+    uint16_t volumeL = (uint16_t) (volumeF + 0.5f);
+    uint16_t volumeDl = (uint16_t) (volumeF * 10.0f + 0.5f);
 
-    sendCommand(idx, (uint8_t) valve, (uint8_t) action, (uint8_t) mode, (uint16_t) duration, (uint16_t) volume);
+    sendCommand(idx, (uint8_t) valve, (uint8_t) action, (uint8_t) mode, (uint16_t) duration, volumeL, volumeDl);
     server.send(200, "text/plain", "ok");
 }
 

@@ -1,3 +1,6 @@
+#include <GardenNode.h>
+#include <GardenProtocol.h>
+
 #include <ESP8266WiFi.h>
 #include <espnow.h>
 #include <EEPROM.h>
@@ -67,6 +70,21 @@ uint8_t activeValvesMask = 0; // БИТОВАЯ МАСКА: бит (i) = кла�
                                // (onCommand() ниже сам это гарантирует), в mode=2 (независимый)
                                // может быть установлено несколько битов сразу. См. IrrigationTelemetry.active_valves
                                // в GardenProtocol.h.
+
+// --- Дозирование по объёму (IrrigationCommand.mode==2, см. GardenProtocol.h) - третий режим
+// открытия клапана, в дополнение к mode=0 (по времени) и легаси-mode=1 (по целым литрам,
+// так и не реализован). В отличие от них, здесь узел САМ закрывает клапан, как только
+// накопленный объём достигает цели - см. checkDosing() ниже, вызывается из loop().
+// Переменные объявлены здесь же, а не рядом с checkDosing() - тот же принцип, что и у
+// configuredValveCount/activeValvesMask выше: читаются/пишутся из нескольких мест файла
+// (onCommand()/checkDosing()/onWatchdogTimeout()/onSetConfig() ниже).
+bool doseActive = false;    // true - прямо сейчас идёт дозирование одного клапана (doseValve ниже)
+uint8_t doseValve = 0;      // номер дозируемого клапана (1..N), бессмыслен при doseActive==false
+uint32_t doseTargetMl = 0;  // целевой объём в мл (1 дл = 100 мл)
+uint32_t doseStartMl = 0;   // снимок totalWaterUsedMl на момент старта дозирования - так как
+                             // totalWaterUsedMl накапливается С МОМЕНТА ВКЛЮЧЕНИЯ узла (а не с начала
+                             // текущего дозирования), checkDosing() сравнивает С РАЗНИЦЕЙ
+                             // (totalWaterUsedMl - doseStartMl) с doseTargetMl, а не totalWaterUsedMl напрямую.
 
 // --- Конфигурация, задаваемая Хабом (MSG_SET_CONFIG) - объявлена ЗДЕСЬ, выше блока
 // датчика потока ниже (вместо своего обычного места рядом с saveConfig()/loadConfig() ниже),
@@ -203,6 +221,36 @@ void processFlowPulses() {
     }
 }
 
+// Третий режим открытия клапана (IrrigationCommand.mode==2) - точная дозировка объёма.
+// Вызывается из loop() ПОСЛЕ processFlowPulses() (только он обновляет totalWaterUsedMl,
+// поэтому порядок вызова в loop() важен - иначе сравнение ниже видело бы устаревшееся
+// значение). Как только накопленный С МОМЕНТА СТАРТА ДОЗИРОВАНИЯ объём достигает
+// цели - закрывает клапан сам, не дожидаясь отдельной команды close от Хаба.
+//
+// ТОЧНОСТЬ: привязана к гранулярности processFlowPulses() (FLOW_PROCESS_INTERVAL_MS=1000Мс) -
+// цель может быть превышена на объём, прошедший за последнюю секунду перед тем, как измерение
+// догонит цель (при типичных расходах это доли литра - для требуемой точности 0.1 л это
+// приемлемый компромисс - для большей точности пришлось бы уменьшать FLOW_PROCESS_INTERVAL_MS).
+void checkDosing() {
+    if (!doseActive) return;
+
+    uint32_t dispensedMl = totalWaterUsedMl - doseStartMl; // корректно и при переполнении uint32_t
+    if (dispensedMl < doseTargetMl) return;
+
+    uint8_t bit = (uint8_t) (1 << (doseValve - 1));
+    activeValvesMask &= ~bit;
+    applyValveState(activeValvesMask);
+    doseActive = false;
+
+    Serial.printf("Дозирование клапана %u завершено: вылито %lu.%01lu л (цель была %lu.%01lu л)\n",
+                  doseValve,
+                  (unsigned long) dispensedMl / 1000UL, (unsigned long) (dispensedMl % 1000UL) / 100UL,
+                  (unsigned long) doseTargetMl / 1000UL, (unsigned long) (doseTargetMl % 1000UL) / 100UL);
+
+    if (activeValvesMask == 0) node.disarmWatchdog();
+    node.sendTelemetryNow();
+}
+
 // --- Конфигурация, задаваемая Хабом (MSG_SET_CONFIG) и хранимая на самом
 // узле в EEPROM - переживает перезагрузку, в отличие от activeValvesMask выше.
 // Сами переменные configuredValveCount/configuredMode/configuredHasFlowSensor/
@@ -303,8 +351,8 @@ void fillTelemetry(UniversalPacket &pkt) {
 
 uint8_t onCommand(const UniversalPacket &pkt) {
     IrrigationCommand cmd = pkt.payload.irrigation.command;
-    Serial.printf("COMMAND RECEIVED: valve=%u action=%u mode=%u duration_sec=%u volume_l=%u\n",
-                  cmd.target_valve, cmd.action, cmd.mode, cmd.duration_sec, cmd.volume_l);
+    Serial.printf("COMMAND RECEIVED: valve=%u action=%u mode=%u duration_sec=%u volume_l=%u volume_dl=%u\n",
+                  cmd.target_valve, cmd.action, cmd.mode, cmd.duration_sec, cmd.volume_l, cmd.volume_dl);
 
     // Клапан за пределами ТЕКУЩЕЙ сконфигурированной ёмкости (см.
     // configuredValveCount/onSetConfig() ниже) - отклоняем, а не молча
@@ -321,10 +369,15 @@ uint8_t onCommand(const UniversalPacket &pkt) {
         // Закрытие работает ОДИНАКОВО в обоих режимах - затрагивает
         // ТОЛЬКО свой бит (или все сразу при target_valve==0) - никакой
         // зависимости от configuredMode здесь нет (в отличие от ACTION_OPEN ниже).
+        // Если закрываемый клапан (или все сразу) сейчас дозируется (doseActive) -
+        // отменяем дозирование, иначе checkDosing() ниже позже попытался бы снова
+        // закрыть уже закрытый клапан/перепутать битовую маску какого-то другого клапана.
         if (cmd.target_valve == 0) {
             activeValvesMask = 0;
+            doseActive = false;
         } else {
             activeValvesMask &= ~(uint8_t) (1 << (cmd.target_valve - 1));
+            if (doseActive && doseValve == cmd.target_valve) doseActive = false;
         }
     } else { // ACTION_OPEN
         if (cmd.target_valve == 0) {
@@ -332,20 +385,50 @@ uint8_t onCommand(const UniversalPacket &pkt) {
             return 1;
         }
         uint8_t bit = (uint8_t) (1 << (cmd.target_valve - 1));
-        if (configuredMode == 1) {
-            // Режим 1 (эксклюзивный) - открытие ЛЮБОГО клапана автоматически
-            // закрывает все остальные - исходное поведение проекта.
+
+        if (cmd.mode == 2) {
+            // Третий режим - точная дозировка объёма с точностью до десятых литра
+            // (volume_dl, см. GardenProtocol.h). Требует датчик потока - без него узлу
+            // нечем измерить вылитый объём, поэтому отклоняем команду через MSG_ACK{status=1},
+            // а не молча открываем клапан без ограничения.
+            if (!configuredHasFlowSensor) {
+                Serial.println("COMMAND отклонена: дозирование (mode=2) требует датчик потока (has_flow_sensor=0)");
+                return 1;
+            }
+            if (cmd.volume_dl == 0) {
+                Serial.println("COMMAND отклонена: дозирование (mode=2) с volume_dl=0 не имеет смысла");
+                return 1;
+            }
+            // ФОРСИРОВАННО эксклюзивно - всегда ровно один клапан, вне зависимости от
+            // configuredMode - смешанный поток через несколько клапанов сделал бы измерение
+            // бессмысленным (общий счётчик импульсов датчика не различает, через какой
+            // клапан прошёл конкретный импульс).
             activeValvesMask = bit;
+            doseActive = true;
+            doseValve = cmd.target_valve;
+            doseTargetMl = (uint32_t) cmd.volume_dl * 100UL; // десятые литра -> мл
+            doseStartMl = totalWaterUsedMl;
+            Serial.printf("Дозирование запущено: клапан=%u целевой объём=%u.%u л\n",
+                          cmd.target_valve, cmd.volume_dl / 10, cmd.volume_dl % 10);
         } else {
-            // Режим 2 (независимый) - открытие этого клапана НЕ трогает
-            // состояние остальных.
-            activeValvesMask |= bit;
+            doseActive = false; // любое не-дозирующее открытие отменяет текущее дозирование, если оно шло
+            if (configuredMode == 1) {
+                // Режим 1 (эксклюзивный) - открытие ЛЮБОГО клапана автоматически
+                // закрывает все остальные - исходное поведение проекта.
+                activeValvesMask = bit;
+            } else {
+                // Режим 2 (независимый) - открытие этого клапана НЕ трогает
+                // состояние остальных.
+                activeValvesMask |= bit;
+            }
         }
     }
 
-    // Реальное управление GPIO. Для mode==1 (полив по объёму, дозировка
-    // команды - не путать с configuredMode) расчёт по датчику потока ещё не
-    // реализован - клапан просто открывается, как при mode==0 (TODO).
+    // Реальное управление GPIO. Для легаси-mode==1 (полив по объёму в целых
+    // литрах, дозировка команды - не путать с configuredMode) расчёт по датчику потока
+    // так и не реализован - клапан просто открывается и остаётся открытым, как при mode==0 без
+    // таймера (TODO). Для mode==2 (точная дозировка) автоматическое закрытие по
+    // достижению цели выполняет checkDosing() ниже (вызывается из loop()), а не эта функция.
     applyValveState(activeValvesMask);
 
     if (activeValvesMask != 0) node.armWatchdog();
@@ -429,6 +512,13 @@ uint8_t onSetConfig(const UniversalPacket &pkt) {
         node.sendTelemetryNow();
     }
 
+    // Любое из двух принудительных закрытий выше могло затронуть бит дозируемого клапана -
+    // если так, дозирование нельзя продолжать - иначе checkDosing() позже попытался бы
+    // снять бит уже закрытого клапана или вовсе чужого, если номера клапанов переиспользовались.
+    if (doseActive && !(activeValvesMask & (uint8_t) (1 << (doseValve - 1)))) {
+        doseActive = false;
+    }
+
     Serial.printf("SET_CONFIG применён и сохранён: valve_count=%u mode=%u has_flow_sensor=%u pulses_per_liter=%u\n",
                   configuredValveCount, configuredMode, configuredHasFlowSensor, configuredFlowPulsesPerLiter);
     return 0;
@@ -436,6 +526,7 @@ uint8_t onSetConfig(const UniversalPacket &pkt) {
 
 void onWatchdogTimeout() {
     activeValvesMask = 0;
+    doseActive = false; // потеря связи с Хабом обрывает и любое текущее дозирование, не только обычные клапаны
     applyValveState(0);
     // Аналогично onCommand() выше - автоматическое закрытие по watchdog
     // тоже реальное изменение состояния клапана, о котором Хаб должен
@@ -505,4 +596,5 @@ void loop() {
     updateFlowEmulation(); // каждую итерацию - пишет в flowPulseCount, см. комментарий там
 #endif
     processFlowPulses(); // сам себя троттлит до FLOW_PROCESS_INTERVAL_MS, можно звать каждую итерацию
+    checkDosing(); // ОБЯЗАТЕЛЬНО ПОСЛЕ processFlowPulses() - см. комментарий у неё
 }

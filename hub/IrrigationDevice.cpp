@@ -1,3 +1,12 @@
+#include <GardenNode.h>
+#include <GardenProtocol.h>
+
+#include <GardenNode.h>
+#include <GardenProtocol.h>
+
+#include <GardenNode.h>
+#include <GardenProtocol.h>
+
 #include "IrrigationDevice.h"
 
 void IrrigationDevice::handlePayload(int idx, const UniversalPacket &pkt) {
