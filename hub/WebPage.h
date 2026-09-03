@@ -167,7 +167,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .valve-section[open] summary { margin-bottom:8px; }
 
   .settings-section { margin-top:14px; border-top:1px solid #eee; padding-top:12px; }
-  .settings-section h3 { font-size:0.9em; margin:0 0 8px; }
+  .settings-section summary { font-size:0.9em; margin:0 0 8px; cursor:pointer; font-weight:600; }
+  .settings-section[open] summary { margin-bottom:8px; }
   /* Один блок настроек автополива на клапан внутри секции "Настройка" - тот же принцип
      разделительных полосок между блоками, что и у .valve-row (см. ниже), но здесь блок
      МНОГОСТРОЧНЫЙ (три поля + кнопка "Сохранить"), а не одна строка. */
@@ -627,14 +628,16 @@ function buildIrrigationTypeSpecific(d) {
     // Настройки автополива по каждому клапану (периодичность/объём/вкл-выкл) - хранятся в NVS
     // Самого Хаба (см. DeviceManager::setValveSchedule()) и НЕ отправляются узлу - сам
     // автополив по расписанию пока не реализован (см. большой комментарий у ValveSchedule в hub/IrrigationDevice.h).
-    // Не сворачиваемая (в отличие от "Управления" ниже) - настройки автополива задаются редко
-    // и сами по себе не такие громоздкие, как список клапанов в "Управлении".
-    '<div class="settings-section" id="modal-settings-section">' +
-      '<h3>Настройка</h3>' +
+    // Сворачиваемая (<details>/<summary>, тот же паттерн, что и у "Управления"/"Конфигурации модуля"
+    // ниже) - по умолчанию СВЁРНУТА (атрибут open не проставлен): настройки автополива
+    // задаются редко, и по умолчанию свёрнутое состояние меньше загромождает окно при открытии
+    // модалки.
+    '<details class="settings-section" id="modal-settings-section">' +
+      '<summary>Настройка</summary>' +
       (d.valveCount > 0
         ? scheduleRows
         : '<span style="color:#999;font-size:0.85em;">Ожидание конфигурации от устройства...</span>') +
-    '</div>' +
+    '</details>' +
     // Сворачиваемая (<details>/<summary>, тот же паттерн, что и у "Конфигурации модуля"
     // ниже) - по умолчанию свёрнута (атрибут open не проставлен): это самая часто
     // используемая часть модалки, но открытые клапаны и так видны точечным
