@@ -541,11 +541,18 @@ void sendSetConfig(int deviceIdx, uint8_t valveCount, uint8_t mode, uint8_t hasF
         Serial.println("Нет такого устройства (см. 'list')");
         return;
     }
-    if (valveCount < 1 || valveCount > 5 || (mode != 1 && mode != 2) ||
+    if (valveCount < 1 || valveCount > 5 || mode < 1 || mode > 3 ||
         (hasFlowSensor != 0 && hasFlowSensor != 1) ||
         pulsesPerLiter < 1 || pulsesPerLiter > 20000) {
-        Serial.println("Некорректная конфигурация: valve_count должен быть 1..5, mode - 1 или 2, "
+        Serial.println("Некорректная конфигурация: valve_count должен быть 1..5, mode - 1, 2 или 3, "
                         "has_flow_sensor - 0 или 1, pulses_per_liter - 1..20000.");
+        return;
+    }
+    if (mode == 3 && hasFlowSensor == 0) {
+        // mode=3 (дозирование) без датчика потока бессмыслен и всё равно будет
+        // отклонён узлом (см. onSetConfig() в flow_node.ino) - лучше не тратить на это
+        // ESP-NOW-пакет и цикл повторных попыток (см. updatePendingCommands() выше).
+        Serial.println("Некорректная конфигурация: mode=3 (дозирование) требует has_flow_sensor=1.");
         return;
     }
     prepareHeader(MSG_SET_CONFIG, deviceManager.devices[deviceIdx]->mac);
@@ -957,10 +964,14 @@ void handleApiSetConfig() {
     int mode = server.arg("mode").toInt();
     int hasFlowSensor = server.arg("hasFlowSensor").toInt();
     int pulsesPerLiter = server.arg("pulsesPerLiter").toInt();
-    if (valveCount < 1 || valveCount > 5 || (mode != 1 && mode != 2) ||
+    if (valveCount < 1 || valveCount > 5 || mode < 1 || mode > 3 ||
         (hasFlowSensor != 0 && hasFlowSensor != 1) ||
         pulsesPerLiter < 1 || pulsesPerLiter > 20000) {
         server.send(400, "text/plain", "invalid valveCount, mode, hasFlowSensor or pulsesPerLiter");
+        return;
+    }
+    if (mode == 3 && hasFlowSensor == 0) {
+        server.send(400, "text/plain", "mode=3 (dosing) requires hasFlowSensor=1");
         return;
     }
     sendSetConfig(idx, (uint8_t) valveCount, (uint8_t) mode, (uint8_t) hasFlowSensor, (uint16_t) pulsesPerLiter);

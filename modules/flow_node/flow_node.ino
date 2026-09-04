@@ -412,9 +412,12 @@ uint8_t onCommand(const UniversalPacket &pkt) {
                           cmd.target_valve, cmd.volume_dl / 10, cmd.volume_dl % 10);
         } else {
             doseActive = false; // любое не-дозирующее открытие отменяет текущее дозирование, если оно шло
-            if (configuredMode == 1) {
-                // Режим 1 (эксклюзивный) - открытие ЛЮБОГО клапана автоматически
-                // закрывает все остальные - исходное поведение проекта.
+            if (configuredMode == 1 || configuredMode == 3) {
+                // Режим 1 (эксклюзивный) и режим 3 (дозирование - он всегда ведёт
+                // себя как эксклюзивный для открытия, даже если команда пришла с
+                // mode!=2 по ошибке клиента - см. IrrigationSpec.mode в GardenProtocol.h) - открытие
+                // ЛЮБОГО клапана автоматически закрывает все остальные - исходное
+                // поведение проекта.
                 activeValvesMask = bit;
             } else {
                 // Режим 2 (независимый) - открытие этого клапана НЕ трогает
@@ -468,8 +471,8 @@ uint8_t onSetConfig(const UniversalPacket &pkt) {
                       cfg.valve_count, MAX_VALVES);
         return 1;
     }
-    if (cfg.mode != 1 && cfg.mode != 2) {
-        Serial.printf("SET_CONFIG отклонён: mode=%u не поддержан (допустимо 1 или 2)\n", cfg.mode);
+    if (cfg.mode < 1 || cfg.mode > 3) {
+        Serial.printf("SET_CONFIG отклонён: mode=%u не поддержан (допустимо 1, 2 или 3)\n", cfg.mode);
         return 1;
     }
     // has_flow_sensor - чисто операторский выбор (см. комментарий у
@@ -483,6 +486,15 @@ uint8_t onSetConfig(const UniversalPacket &pkt) {
     if (cfg.flow_pulses_per_liter < MIN_FLOW_PULSES_PER_LITER || cfg.flow_pulses_per_liter > MAX_FLOW_PULSES_PER_LITER) {
         Serial.printf("SET_CONFIG отклонён: flow_pulses_per_liter=%u вне диапазона %u..%u\n",
                       cfg.flow_pulses_per_liter, MIN_FLOW_PULSES_PER_LITER, MAX_FLOW_PULSES_PER_LITER);
+        return 1;
+    }
+    // mode=3 (дозирование, см. IrrigationSpec.mode в GardenProtocol.h) без датчика потока
+    // бессмыслен - веб-интерфейс в этом режиме всегда будет отправлять дозирующие
+    // команды (IrrigationCommand.mode=2), а они без датчика всё равно будут отклонены
+    // onCommand() ниже - лучше сразу не дать включить эту бессмысленную комбинацию,
+    // чем молча её принять.
+    if (cfg.mode == 3 && cfg.has_flow_sensor == 0) {
+        Serial.println("SET_CONFIG отклонён: mode=3 (дозирование) требует has_flow_sensor=1 в этом же пакете");
         return 1;
     }
 
@@ -502,11 +514,13 @@ uint8_t onSetConfig(const UniversalPacket &pkt) {
         node.sendTelemetryNow();
     }
 
-    // Если переключились в эксклюзивный режим (mode=1), пока открыто больше
-    // одного клапана (наследие независимого режима) - непонятно, какой
-    // из них теперь "главный", поэтому безопаснее закрыть всё и ждать явную
-    // новую команду, чем произвольно выбрать один из открытых.
-    if (configuredMode == 1 && (activeValvesMask & (activeValvesMask - 1)) != 0) {
+    // Если переключились в эксклюзивный (mode=1) или дозирующий (mode=3, он всегда
+    // ведёт себя как эксклюзивный для открытия клапанов, см. IrrigationSpec.mode в
+    // GardenProtocol.h) режим, пока открыто больше одного клапана (наследие
+    // независимого режима) - непонятно, какой из них теперь "главный", поэтому
+    // безопаснее закрыть всё и ждать явную новую команду, чем произвольно выбрать
+    // один из открытых.
+    if ((configuredMode == 1 || configuredMode == 3) && (activeValvesMask & (activeValvesMask - 1)) != 0) {
         activeValvesMask = 0;
         applyValveState(0);
         node.sendTelemetryNow();

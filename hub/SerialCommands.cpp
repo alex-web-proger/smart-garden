@@ -31,10 +31,11 @@ extern void sendSetConfig(int deviceIdx, uint8_t valveCount, uint8_t mode, uint8
 //                                    датчика потока (config ... hasFlowSensor=1), всегда ФОРСИРОВАННО открывает
 //                                    РОВНО ОДИН клапан, закрывая остальные, <liters> дробное (например "2.5")
 //   close <idx> [valve]           - закрыть один конкретный клапан (если указан) или все сразу
-//                                    (без valve) - работает одинаково в обоих режимах
+//                                    (без valve) - работает одинаково во всех режимах
 //   config <idx> <valves> <mode> <hasFlowSensor> <pulsesPerLiter>
 //                                 - задать устройству количество каналов (1..5), режим
-//                                    работы (1 - эксклюзивный, 2 - независимый), наличие
+//                                    работы (1 - эксклюзивный, 2 - независимый, 3 -
+//                                    дозирование, требует hasFlowSensor=1), наличие
 //                                    датчика потока (0|1) и его разрешение (импульсов на
 //                                    литр, 1..20000) - хранится НА САМОМ узле (EEPROM),
 //                                    переживает его перезагрузку, в отличие от open/volume/dose/close
@@ -115,7 +116,7 @@ void handleSerialCommand(String line) {
         if (sscanf(line.c_str(), "config %d %d %d %d %d", &idx, &valves, &mode, &hasFlowSensor, &pulsesPerLiter) == 5) {
             sendSetConfig(idx, (uint8_t) valves, (uint8_t) mode, (uint8_t) hasFlowSensor, (uint16_t) pulsesPerLiter);
         } else {
-            Serial.println("Использование: config <idx> <valves 1..5> <mode 1|2> <hasFlowSensor 0|1> <pulsesPerLiter 1..20000>");
+            Serial.println("Использование: config <idx> <valves 1..5> <mode 1|2|3> <hasFlowSensor 0|1> <pulsesPerLiter 1..20000>");
         }
     } else if (cmd == "install") {
         int idx;
