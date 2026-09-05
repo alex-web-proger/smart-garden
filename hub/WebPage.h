@@ -1622,8 +1622,9 @@ function takenValves(deviceIdx, excludeBedId) {
 }
 
 // Заполняет <select> линий вариантами 1..valveCount, помечая уже занятые другими
-// грядками (см. takenValves() выше) как disabled - и выбирает по умолчанию первую
-// свободную линию, а не полагается на то, что браузер сам пропустит задизейбленный
+// грядками (см. takenValves() выше) как disabled (без отдельной пометки в тексте опции -
+// того, что вариант недоступен и выглядит блекло, достаточно само по себе) - и выбирает по
+// умолчанию первую свободную линию, а не полагается на то, что браузер сам пропустит задизейбленный
 // первый <option> (это не гарантировано во всех браузерах, если ни у одного option нет
 // явного атрибута selected). preselectValve (если передан и сам не занят - актуально
 // при редактировании грядки, её собственная текущая линия уже исключена из taken через
@@ -1635,7 +1636,7 @@ function populateValveOptions(selectEl, valveCount, taken, preselectValve) {
     const opt = document.createElement('option');
     opt.value = v;
     const isTaken = taken.has(v);
-    opt.textContent = 'Линия ' + v + (isTaken ? ' (занята другой грядкой)' : '');
+    opt.textContent = 'Линия ' + v;
     opt.disabled = isTaken;
     selectEl.appendChild(opt);
     if (!isTaken && firstFreeValue === null) firstFreeValue = v;
