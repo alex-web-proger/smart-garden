@@ -136,7 +136,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
      ранней версии), чтобы все грядки читались как один визуальный набор. Шестерёнка
      (бывший крестик удаления) открывает модалку "Настройки грядки" (см.
      openBedSettingsModal() в скрипте) - тот же приём, что и у .gear-btn на карточке
-     устройства ниже, просто свой CSS-класс для читаемости. */
+     устройства ниже, просто свой CSS-класс для читаемости. Круглая кнопка ниже (см.
+     .bed-toggle-btn) - ручное включение/выключение полива РОВНО ТОЙ линии, к которой
+     привязана грядка, см. toggleBedIrrigation() в скрипте. */
   .beds-toolbar { margin-bottom:12px; }
   .bed-card { position:relative; background:#eafbd7; border-radius:10px; padding:14px 50px 14px 14px;
               border:2px solid #c5e8a0; box-shadow:0 1px 3px rgba(0,0,0,0.07);
@@ -151,6 +153,21 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                   box-shadow:none; }
   .bed-gear-btn svg { width:30px; height:30px; fill:#5a7a4a; }
   .bed-gear-btn:active svg { fill:#2f4a24; }
+
+  /* --- Круглая кнопка РУЧНОГО включения/выключения полива грядки - переключает РОВНО ТУ
+     линию, к которой привязана грядка (см. toggleBedIrrigation() в скрипте, использует ту же
+     sendCmd(), что и кнопки "Открыть"/"Закрыть" в модалке устройства). Цвет отражает текущее
+     состояние (зелёный - открыт, серый - закрыт), а не действие кнопки - тот же принцип, что и у
+     .valve-state.open/.closed в модалке устройства. Задизейблена (тускло-серая), если модуль
+     сейчас не резолвится (забыт) - см. updateBedCard() в скрипте. */
+  .bed-controls { display:flex; align-items:center; gap:10px; margin-top:10px; }
+  .bed-toggle-btn { width:44px; height:44px; border-radius:50%; border:none; cursor:pointer;
+                     flex:0 0 auto; display:flex; align-items:center; justify-content:center; padding:0;
+                     background:#8a97a3; box-shadow:0 1px 3px rgba(0,0,0,0.2); }
+  .bed-toggle-btn svg { width:22px; height:22px; fill:#fff; }
+  .bed-toggle-btn.bed-toggle-on { background:#2a7d2a; }
+  .bed-toggle-btn:disabled { background:#ccc; cursor:not-allowed; box-shadow:none; }
+  .bed-toggle-label { font-size:0.78em; color:#666; }
 
   .device-card { position:relative; background:#fff; border-radius:10px; padding:14px 50px 14px 14px;
                  border:2px solid transparent; box-shadow:0 1px 3px rgba(0,0,0,0.07); cursor:default; }
@@ -1433,8 +1450,15 @@ function createBedCard(b) {
     '</button>' +
     '<div class="bed-name"></div>' +
     '<div class="bed-crop"></div>' +
-    '<div class="bed-line"></div>';
+    '<div class="bed-line"></div>' +
+    '<div class="bed-controls">' +
+      '<button class="bed-toggle-btn" title="Включить/выключить полив">' +
+        '<svg viewBox="0 0 24 24"><path d="M12 2C12 2 5 10.5 5 15a7 7 0 0 0 14 0c0-4.5-7-13-7-13z"/></svg>' +
+      '</button>' +
+      '<span class="bed-toggle-label"></span>' +
+    '</div>';
   el.querySelector('.bed-gear-btn').addEventListener('click', () => openBedSettingsModal(b.id));
+  el.querySelector('.bed-toggle-btn').addEventListener('click', () => toggleBedIrrigation(b.id));
   return el;
 }
 
@@ -1450,14 +1474,61 @@ function updateBedCard(el, b) {
 
   const dev = devicesByIdx[b.deviceIdx];
   const lineEl = el.querySelector('.bed-line');
+  const toggleBtn = el.querySelector('.bed-toggle-btn');
+  const toggleLabel = el.querySelector('.bed-toggle-label');
   if (dev) {
     const devName = (dev.name && dev.name.length > 0) ? dev.name : ('Узел #' + b.deviceIdx);
     lineEl.textContent = devName + ' · линия ' + b.valve;
     lineEl.classList.remove('bed-line-missing');
+
+    const isOpen = ((dev.activeValvesMask >> (b.valve - 1)) & 1) === 1;
+    toggleBtn.disabled = false;
+    toggleBtn.classList.toggle('bed-toggle-on', isOpen);
+    toggleBtn.title = isOpen ? 'Закрыть полив' : 'Открыть полив';
+    toggleLabel.textContent = isOpen ? 'Полив включён' : 'Полив выключен';
   } else {
     lineEl.textContent = 'Модуль #' + b.deviceIdx + ' не найден (забыт/переустановлен)';
     lineEl.classList.add('bed-line-missing');
+
+    toggleBtn.disabled = true;
+    toggleBtn.classList.remove('bed-toggle-on');
+    toggleBtn.title = 'Модуль недоступен';
+    toggleLabel.textContent = 'Модуль недоступен';
   }
+}
+
+// Ручное включение/выключение полива круглой кнопкой на карточке грядки - переключает
+// РОВНО ТУ линию, к которой привязана грядка - использует ту же sendCmd(), что и кнопки
+// "Открыть"/"Закрыть" в модалке устройства (см. valveButtonClick() выше) - тот же принцип
+// выбора режима: если у модуля включено точное дозирование (mode===3), открытие шлёт как
+// доза на объём из собственного расписания грядки (dev.valveSchedules[b.valve-1].volumeL, то же "Объём, л"
+// из её модалки настроек), иначе - просто открывается без ограничения (duration всё равно пока
+// ничем не управляется на самом узле, см. комментарий в onCommand() в flow_node.ino) - оператор закрывает
+// вручную этой же кнопкой повторно. ВНИМАНИЕ: в режиме 1 (эксклюзивный) открытие этой линии закроет
+// все остальные клапаны этого же модуля (в том числе линии других грядок на нём) - то же самое
+// поведение, что и у кнопок клапанов в модалке устройства, ничего особо не добавлено. Кнопка и так
+// задизейблена, если модуль не резолвится (см. updateBedCard() выше), так что отдельная проверка здесь -
+// только на всякий случай.
+async function toggleBedIrrigation(id) {
+  const b = bedsByIdx[id];
+  if (!b) return;
+  const dev = devicesByIdx[b.deviceIdx];
+  if (!dev) return;
+
+  const isOpen = ((dev.activeValvesMask >> (b.valve - 1)) & 1) === 1;
+  if (isOpen) {
+    await sendCmd(b.deviceIdx, b.valve, 1, 0, 0, 0);
+  } else if (dev.mode === 3) {
+    const sched = dev.valveSchedules && dev.valveSchedules[b.valve - 1];
+    const liters = (sched && sched.volumeL > 0) ? sched.volumeL : 1.0;
+    await sendCmd(b.deviceIdx, b.valve, 0, 2, 0, liters);
+  } else {
+    await sendCmd(b.deviceIdx, b.valve, 0, 0, 0, 0);
+  }
+  // sendCmd() уже планирует refresh() через 300 мс (он обновляет devicesByIdx, откуда берётся
+  // состояние этой кнопки) - добавляем свой чуть позже refreshBeds(), чтобы карточка
+  // грядки обновилась сразу, а не ждала своего собственного тика автообновления (до 2 сек).
+  setTimeout(refreshBeds, 350);
 }
 
 async function refreshBeds() {
