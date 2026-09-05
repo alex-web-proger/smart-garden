@@ -246,6 +246,10 @@ Android; на Windows зависит от наличия Bonjour Print Services)
 | `/api/install` | POST | `application/x-www-form-urlencoded`: `idx` | Подтвердить устройство: защитить от вытеснения, сохранить в NVS |
 | `/api/forget` | POST | `application/x-www-form-urlencoded`: `idx` | Удалить устройство из таблицы (и из NVS, если было установлено) |
 | `/api/rename` | POST | `application/x-www-form-urlencoded`: `idx, name` | Задать/сменить название — ТОЛЬКО для установленного устройства, сохраняется в NVS |
+| `/api/beds` | GET | JSON-массив `{id, name, cropId, deviceIdx, valve}` | Список грядок (вкладка "Грядки" в веб-интерфейсе, см. `BedManager.h`) |
+| `/api/addBed` | POST | `application/x-www-form-urlencoded`: `name, cropId, deviceIdx, valve` | Создать грядку — привязывает её к линии `valve` уже установленного модуля полива `deviceIdx` НЕЗАВИСИМО от того, на связи ли он сейчас (если модуль ещё ни разу не присылал `valveCount`, допустимы любые линии 1..`MAX_IRRIGATION_VALVES`); `cropId` — см. `CropType` в `BedManager.h`; `409`, если эта линия уже занята другой грядкой |
+| `/api/updateBed` | POST | `application/x-www-form-urlencoded`: `id, name, cropId, deviceIdx, valve` | Изменить уже существующую грядку (название/культура/привязка) — та же валидация (включая 409 на занятую линию), что и у `/api/addBed`, но сама грядка при этой проверке исключена |
+| `/api/deleteBed` | POST | `application/x-www-form-urlencoded`: `id` | Удалить грядку (модуль полива и его настройки не затрагивает) |
 | `/api/settime` | POST | `application/x-www-form-urlencoded`: `epoch` (целое число секунд, МЕСТНОЕ время браузера, не UTC) | Установить часы Хаба (вызывается автоматически самой страницей при каждой загрузке); если обнаружена DS3231, время попутно записывается и в неё |
 | `/api/status` | GET | JSON `{timeSynced, epoch, timeString, rtcPresent, apEnabled, radioReady}` | Служебный статус Хаба: часы, обнаружена ли DS3231, включена ли точка доступа, готово ли радио ESP-NOW |
 

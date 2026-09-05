@@ -13,6 +13,7 @@
 #include "WebPage.h"
 #include "Device.h"
 #include "DeviceManager.h"
+#include "BedManager.h"
 #include "SerialCommands.h"
 #include "Ds3231Rtc.h"
 #include "ApButton.h"
@@ -302,6 +303,7 @@ PendingCommand pendingCommands[MAX_DEVICES];
 WebServer server(80);
 
 DeviceManager deviceManager;
+BedManager bedManager;
 Ds3231Rtc rtc;
 ApButton apButton;
 
@@ -1031,6 +1033,180 @@ void handleApiSetValveSchedule() {
     server.send(200, "text/plain", "ok");
 }
 
+// GET /api/beds - список грядок в JSON. Формат аналогичен /api/devices выше -
+// собирается вручную (без ArduinoJson), таблица маленькая (MAX_BEDS=32, см.
+// BedManager.h). Грядка хранит привязку к модулю по MAC (см. большой
+// комментарий в BedManager.h), но наружу отдаётся текущий разрешённый через
+// deviceManager.find() индекс (а не сам MAC - фронтенду он не нужен и знать его
+// не должен). Если устройство с этим MAC больше не найдено (забыли) -
+// deviceIdx в ответе равен -1, веб-страница сама решает, как это показать
+// (см. updateBedCard() в WebPage.h).
+void handleApiBeds() {
+    String json = "[";
+    bool first = true;
+    for (int i = 0; i < MAX_BEDS; i++) {
+        if (!bedManager.isValid(i)) continue;
+        if (!first) json += ",";
+        first = false;
+        GardenBed &b = bedManager.beds[i];
+        int resolvedIdx = deviceManager.find(b.mac);
+        json += "{\"id\":" + String(i) +
+                ",\"name\":\"" + jsonEscape(String(b.name)) + "\"" +
+                ",\"cropId\":" + String(b.cropId) +
+                ",\"deviceIdx\":" + String(resolvedIdx) +
+                ",\"valve\":" + String(b.valve) + "}";
+    }
+    json += "]";
+    server.send(200, "application/json", json);
+}
+
+// Общая проверка привязки грядки к модулю/линии - общая часть handleApiAddBed()
+// и handleApiUpdateBed() ниже (та же валидация нужна и при создании, и при
+// редактировании грядки). Возвращает указатель на IrrigationDevice, если всё в порядке,
+// или nullptr - тогда responseError уже заполнен готовым текстом ошибки для ответа клиенту.
+//
+// ГРЯДКА ПРИВЯЗЫВАЕТСЯ К УСТАНОВЛЕННОМУ МОДУЛЮ НЕЗАВИСИМО ОТ ТОГО, НА СВЯЗИ ЛИ ОН
+// СЕЙЧАС: проверяется ТОЛЬКО installed (оператор явно подтвердил устройство раньше),
+// а НЕ текущая связь (lastSeenTime/agoSec) - грядка это чисто хабовая настройка,
+// её имеет смысл задать/чинить даже пока модуль временно не на связи (сел без
+// связи/ещё не вышел на связь с момента последней перезагрузки Хаба) - оператору виднее
+// на месте, к чему что физически подключено, и нет причин заставлять его ждать очередного
+// выхода на связь ради простого создания/редактирования грядки.
+IrrigationDevice *validateBedBinding(int deviceIdx, int valve, String &responseError) {
+    if (!deviceManager.isValid(deviceIdx) || !deviceManager.devices[deviceIdx]->installed ||
+        deviceManager.devices[deviceIdx]->deviceType != TYPE_IRRIGATION) {
+        responseError = "deviceIdx does not refer to an installed irrigation module";
+        return nullptr;
+    }
+    // Приведение типа безопасно: тип только что сверен с TYPE_IRRIGATION выше -
+    // единственный наследник Device с этим deviceType (см. DeviceManager::registerAt()).
+    IrrigationDevice *dev = (IrrigationDevice *) deviceManager.devices[deviceIdx];
+    // valveCount НЕ хранится в NVS (см. DeviceManager::InstalledDeviceRecord в DeviceManager.h) -
+    // это текущая ПОДТВЕРЖДЁННАЯ узлом конфигурация (последний принятый MSG_CONFIG с
+    // момента последней перезагрузки Хаба) - равна 0, пока узел ещё ни разу не вышел
+    // на связь после последнего сброса Хаба - тогда пределом становится
+    // MAX_IRRIGATION_VALVES (максимум, который вообще поддерживает прошивка, см.
+    // IrrigationDevice.h), а НЕ ещё НЕИЗВЕСТНОЕ на данный момент текущее значение valveCount - именно
+    // это и позволяет привязывать грядку к установленному модулю независимо от того, на связи ли он сейчас.
+    uint8_t maxValve = dev->valveCount > 0 ? dev->valveCount : MAX_IRRIGATION_VALVES;
+    if (valve < 1 || valve > maxValve) {
+        responseError = "invalid valve for this module";
+        return nullptr;
+    }
+    return dev;
+}
+
+// POST /api/addBed - form-urlencoded: name, cropId, deviceIdx, valve.
+// Грядка - чисто надстроечная сущность НАД уже существующим модулем полива
+// (см. большой комментарий в BedManager.h) - привязка проверяется validateBedBinding()
+// выше: модуль должен существовать, быть УСТАНОВЛЕННЫМ, иметь тип
+// TYPE_IRRIGATION, а valve - быть в пределах его ТЕКУЩЕГО подтверждённого valveCount.
+// Привязка в BedManager хранится по MAC найденного устройства, а не по его
+// текущему deviceIdx (см. большой комментарий в BedManager.h) - deviceIdx здесь только
+// чтобы найти нужный mac в deviceManager.devices[].
+void handleApiAddBed() {
+    if (!server.hasArg("name") || !server.hasArg("cropId") ||
+        !server.hasArg("deviceIdx") || !server.hasArg("valve")) {
+        server.send(400, "text/plain", "missing name, cropId, deviceIdx or valve");
+        return;
+    }
+    String name = server.arg("name");
+    int cropId = server.arg("cropId").toInt();
+    int deviceIdx = server.arg("deviceIdx").toInt();
+    int valve = server.arg("valve").toInt();
+
+    if (name.length() == 0) {
+        server.send(400, "text/plain", "name must not be empty");
+        return;
+    }
+    if (cropId < CROP_TYPE_MIN || cropId > CROP_TYPE_MAX) {
+        server.send(400, "text/plain", "invalid cropId");
+        return;
+    }
+    String bindError;
+    IrrigationDevice *dev = validateBedBinding(deviceIdx, valve, bindError);
+    if (dev == nullptr) {
+        server.send(400, "text/plain", bindError);
+        return;
+    }
+    // Та же проверка, что и в выпадающем списке линий на веб-странице (см. takenValves()
+    // в WebPage.h) - но ЗДЕСЬ, а не только там, чтобы отклонять повторную привязку даже в
+    // обход веб-интерфейса (прямой запрос к API). excludeId=-1 - при СОЗДАНИИ никакая
+    // грядка ещё не исключается из проверки (см. isValveTakenByOtherBed() в BedManager.h).
+    if (bedManager.isValveTakenByOtherBed(deviceManager.devices[deviceIdx]->mac, (uint8_t) valve, -1)) {
+        server.send(409, "text/plain", "this valve is already bound to another bed");
+        return;
+    }
+
+    int id = bedManager.addBed(name.c_str(), (uint8_t) cropId, deviceManager.devices[deviceIdx]->mac, (uint8_t) valve);
+    if (id < 0) {
+        server.send(507, "text/plain", "bed table full");
+        return;
+    }
+    server.send(200, "text/plain", "ok");
+}
+
+// POST /api/updateBed - form-urlencoded: id, name, cropId, deviceIdx, valve.
+// Изменяет уже существующую грядку - та же валидация привязки, что и у
+// handleApiAddBed() выше (через тот же validateBedBinding()) - позволяет как
+// переименовать/сменить культуру без смены привязки, так и перевязать грядку на
+// другой модуль/линию из того же модального окна "Настройки грядки" (см. WebPage.h).
+void handleApiUpdateBed() {
+    if (!server.hasArg("id") || !server.hasArg("name") || !server.hasArg("cropId") ||
+        !server.hasArg("deviceIdx") || !server.hasArg("valve")) {
+        server.send(400, "text/plain", "missing id, name, cropId, deviceIdx or valve");
+        return;
+    }
+    int id = server.arg("id").toInt();
+    String name = server.arg("name");
+    int cropId = server.arg("cropId").toInt();
+    int deviceIdx = server.arg("deviceIdx").toInt();
+    int valve = server.arg("valve").toInt();
+
+    if (name.length() == 0) {
+        server.send(400, "text/plain", "name must not be empty");
+        return;
+    }
+    if (cropId < CROP_TYPE_MIN || cropId > CROP_TYPE_MAX) {
+        server.send(400, "text/plain", "invalid cropId");
+        return;
+    }
+    String bindError;
+    IrrigationDevice *dev = validateBedBinding(deviceIdx, valve, bindError);
+    if (dev == nullptr) {
+        server.send(400, "text/plain", bindError);
+        return;
+    }
+    // Та же проверка, что и в handleApiAddBed() выше - НО id исключается из подсчёта
+    // (сама редактируемая грядка вполне может оставаться привязанной к той же самой линии).
+    if (bedManager.isValveTakenByOtherBed(deviceManager.devices[deviceIdx]->mac, (uint8_t) valve, id)) {
+        server.send(409, "text/plain", "this valve is already bound to another bed");
+        return;
+    }
+
+    if (!bedManager.updateBed(id, name.c_str(), (uint8_t) cropId, deviceManager.devices[deviceIdx]->mac, (uint8_t) valve)) {
+        server.send(404, "text/plain", "bed not found");
+        return;
+    }
+    server.send(200, "text/plain", "ok");
+}
+
+// POST /api/deleteBed - form-urlencoded: id.
+// Удаляет грядку - НЕ трогает сам модуль полива/его настройки (грядка -
+// чисто надстроечная сущность, см. большой комментарий в BedManager.h).
+void handleApiDeleteBed() {
+    if (!server.hasArg("id")) {
+        server.send(400, "text/plain", "missing id");
+        return;
+    }
+    int id = server.arg("id").toInt();
+    if (!bedManager.deleteBed(id)) {
+        server.send(404, "text/plain", "bed not found");
+        return;
+    }
+    server.send(200, "text/plain", "ok");
+}
+
 // POST /api/settime - form-urlencoded: epoch (целое число секунд, МЕСТНОЕ время браузера,
 // уже со сдвигом на часовой пояс, не UTC - см. localEpochSeconds() в WebPage.h).
 // Вызывается автоматически самим веб-интерфейсом при каждой
@@ -1390,6 +1566,12 @@ void setup() {
     // чем туда сможет попасть что-либо автообнаруженное.
     deviceManager.loadFromNVS();
 
+    // Грядки - чисто хабовая надстройка над таблицей устройств (см. большой
+    // комментарий в BedManager.h) - не участвуют в ESP-NOW/LRU вообще, поэтому порядок
+    // восстановления относительно deviceManager.loadFromNVS() выше не важен - оставлено рядом
+    // чисто для читаемости (оба восстановления из NVS рядом).
+    bedManager.loadFromNVS();
+
     // Радиоканал фиксируем явно тем же ESPNOW_CHANNEL, что у периферии, ещё
     // ДО включения точки доступа (которая по умолчанию теперь выключена,
     // см. блок "Кнопка/точка доступа" выше) - иначе ESP-NOW окажется без
@@ -1447,6 +1629,10 @@ void setup() {
     server.on("/api/forget", HTTP_POST, handleApiForget);
     server.on("/api/rename", HTTP_POST, handleApiRename);
     server.on("/api/setValveSchedule", HTTP_POST, handleApiSetValveSchedule);
+    server.on("/api/beds", HTTP_GET, handleApiBeds);
+    server.on("/api/addBed", HTTP_POST, handleApiAddBed);
+    server.on("/api/updateBed", HTTP_POST, handleApiUpdateBed);
+    server.on("/api/deleteBed", HTTP_POST, handleApiDeleteBed);
     server.on("/api/settime", HTTP_POST, handleApiSetTime);
     server.on("/api/status", HTTP_GET, handleApiStatus);
     server.on("/api/setTxPower", HTTP_POST, handleApiSetTxPower);

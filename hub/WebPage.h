@@ -121,6 +121,37 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
   .empty { padding: 30px; text-align:center; color:#999; background:#fff; border-radius:10px; }
 
+  /* --- Вкладки верхнего уровня (Устройства/Грядки) - переключают видимость двух
+     верхнеуовневых блоков (#view-devices/#view-beds ниже) через display - см. switchView() в
+     скрипте. Оба блока всё равно обновляются в фоне независимо от того, какой
+     сейчас виден - тот же принцип, что и у модалки "Настройки Хаба" выше. */
+  .tabs { display:flex; gap:8px; margin-bottom:14px; }
+  .tab-btn { padding:8px 14px; border-radius:8px; border:none; background:#e2e2da; color:#555;
+             font-size:0.85em; font-weight:600; cursor:pointer; }
+  .tab-btn.active { background:#4a7c3f; color:#fff; }
+
+  /* --- Страница "Грядки" - грядки отображаются прямоугольниками в той же адаптивной сетке
+     (.grid), что и карточки устройств выше - тот же принцип вёрстки, просто другой класс
+     карточки. Фон всегда СВЕТЛО-САЛАТОВЫЙ (не по культуре - в отличие от более
+     ранней версии), чтобы все грядки читались как один визуальный набор. Шестерёнка
+     (бывший крестик удаления) открывает модалку "Настройки грядки" (см.
+     openBedSettingsModal() в скрипте) - тот же приём, что и у .gear-btn на карточке
+     устройства ниже, просто свой CSS-класс для читаемости. */
+  .beds-toolbar { margin-bottom:12px; }
+  .bed-card { position:relative; background:#eafbd7; border-radius:10px; padding:14px 50px 14px 14px;
+              border:2px solid #c5e8a0; box-shadow:0 1px 3px rgba(0,0,0,0.07);
+              min-height:88px; display:flex; flex-direction:column; justify-content:space-between; }
+  .bed-name { font-weight:600; font-size:1.05em; margin-bottom:4px; word-break:break-word; }
+  .bed-crop { font-size:0.85em; color:#444; }
+  .bed-line { font-size:0.78em; color:#888; margin-top:6px; }
+  .bed-line.bed-line-missing { color:#c0392b; }
+  .bed-gear-btn { position:absolute; top:8px; right:8px; width:auto; height:auto; border-radius:0;
+                  border:none; background:none; cursor:pointer; padding:0;
+                  display:flex; align-items:center; justify-content:center;
+                  box-shadow:none; }
+  .bed-gear-btn svg { width:30px; height:30px; fill:#5a7a4a; }
+  .bed-gear-btn:active svg { fill:#2f4a24; }
+
   .device-card { position:relative; background:#fff; border-radius:10px; padding:14px 50px 14px 14px;
                  border:2px solid transparent; box-shadow:0 1px 3px rgba(0,0,0,0.07); cursor:default; }
   .device-card.status-installed { background:#e9f6e4; border-color:#bfe0b2; }
@@ -218,10 +249,33 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.63c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
   </button>
 </h1>
+<!-- Вкладки верхнего уровня - Страница "Грядки" является НАДСТРОЙКОЙ над
+     модулями полива со страницы "Устройства" (грядка ссылается на конкретный
+     модуль/линию, см. BedManager.h), поэтому обе страницы живут на одной HTML-странице
+     и переключаются простыми вкладками (switchView() в скрипте), а не отдельными
+     запросами к Hab'у. -->
+<div class="tabs">
+  <button class="tab-btn active" id="tab-btn-devices" onclick="switchView('devices')">Устройства</button>
+  <button class="tab-btn" id="tab-btn-beds" onclick="switchView('beds')">Грядки</button>
+</div>
+
+<div id="view-devices">
 <div id="uptime-status">Время после сброса: —</div>
 <div id="temp-status">Температура Хаба: —</div>
 
 <div class="grid" id="devices-grid"><div class="empty">Загрузка...</div></div>
+</div>
+
+<!-- Страница "Грядки" - скрыта по умолчанию (стартуем на вкладке "Устройства", см.
+     switchView() выше). Кнопка "Добавить грядку" всегда наверху, независимо от того,
+     есть ли уже грядки - именно она и есть то "простое" начальное состояние страницы, когда
+     грядок ещё нет. -->
+<div id="view-beds" style="display:none;">
+  <div class="beds-toolbar">
+    <button onclick="openAddBedModal()">+ Добавить грядку</button>
+  </div>
+  <div class="grid" id="beds-grid"><div class="empty">Грядок пока нет</div></div>
+</div>
 
 <!-- Модальное окно с подробностями устройства - одно на страницу,
      переиспользуется для любого устройства (см. openModal() в скрипте) -->
@@ -319,6 +373,118 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </div>
 </div>
 
+<!-- Модальное окно создания новой грядки - открывается кнопкой "+ Добавить грядку" на
+     вкладке "Грядки" (см. openAddBedModal() в скрипте). Список модулей полива
+     (#bed-device-select) строится из уже загруженных devicesByIdx (та же переменная, что
+     и у карточек устройств на вкладке "Устройства") - отдельного сетевого запроса для
+     этого не нужно, refresh() и так опрашивает /api/devices каждые 2 сек независимо от того,
+     какая вкладка сейчас открыта. В список попадают ВСЕ установленные узлы полива
+     независимо от того, на связи ли они сейчас (см. populateBedDeviceOptions() в скрипте) -
+     привязать грядку можно и к модулю, который ещё/уже не выходил на связь. Список линий
+     (#bed-valve-select) зависит от выбранного модуля (его valveCount, если уже известен, иначе
+     запасной MAX_IRRIGATION_VALVES) и перестраивается при смене модуля (onchange, см.
+     updateBedValveOptions() в скрипте). -->
+<div class="modal-backdrop" id="bed-modal-backdrop">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>Новая грядка</h2>
+      <button class="modal-close" onclick="closeBedModal()">×</button>
+    </div>
+    <div class="modal-field">
+      <span>Название</span>
+      <input type="text" id="bed-name-input" maxlength="23" placeholder="Например, У забора" style="width:180px; padding:4px 6px; border:1px solid #ccc; border-radius:4px; font-size:0.85em;">
+    </div>
+    <div class="modal-field">
+      <span>Культура</span>
+      <select id="bed-crop-select"></select>
+    </div>
+    <div class="modal-field">
+      <span>Модуль полива</span>
+      <select id="bed-device-select" onchange="updateBedValveOptions()"></select>
+    </div>
+    <div class="modal-field">
+      <span>Линия (клапан)</span>
+      <select id="bed-valve-select"></select>
+    </div>
+    <div id="bed-modal-hint" style="font-size:0.78em; color:#c0392b; margin-top:6px; display:none;">
+      Нет доступных модулей полива - сначала установите хотя бы один узел полива на
+      вкладке "Устройства".
+    </div>
+    <div id="bed-modal-unknown-count-hint" style="font-size:0.78em; color:#999; margin-top:6px; display:none;">
+      Точное число линий этого модуля пока неизвестно (он ещё не выходил на связь с момента
+      последней перезагрузки Хаба) - показаны все возможные 1..5, уточните номер на месте.
+    </div>
+    <div class="modal-actions">
+      <button id="bed-save-btn" onclick="saveNewBed(this)">Добавить</button>
+    </div>
+  </div>
+</div>
+
+<!-- Модальное окно настроек уже СУЩЕСТВУЮЩЕЙ грядки - открывается шестерёнкой на
+     её карточке (см. openBedSettingsModal() в скрипте). Верхняя часть (название/
+     культура/модуль/линия) повторяет модалку создания выше, но в своих собственных полях
+     (отдельный набор id, чтобы обе модалки могли быть открыты независимо). Ниже -
+     секция "Полив" с ТЕМИ ЖЕ полями, что и в секции "Настройка" модалки устройства (id="modal-settings-section"
+     выше) - периодичность/объём/автополив, но для РОВНО ОДНОЙ (текущей выбранной выше) линии,
+     а не по одной строке на каждый клапан модуля - грядка привязана ровно к одной линии, показывать
+     остальные здесь бессмысленно. Поля перезаполняются из devicesByIdx[...].valveSchedules при
+     открытии и при каждой смене модуля/линии (см. renderBedScheduleFields() в скрипте), а
+     сохраняются одной общей кнопкой "Сохранить" вместе с привязкой (см. saveBedSettings() в
+     скрипте - два POST-запроса подряд, но для оператора это одно действие). -->
+<div class="modal-backdrop" id="bed-settings-modal-backdrop">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>Настройки грядки</h2>
+      <button class="modal-close" onclick="closeBedSettingsModal()">×</button>
+    </div>
+    <div class="modal-field">
+      <span>Название</span>
+      <input type="text" id="bed-settings-name-input" maxlength="23" style="width:180px; padding:4px 6px; border:1px solid #ccc; border-radius:4px; font-size:0.85em;">
+    </div>
+    <div class="modal-field">
+      <span>Культура</span>
+      <select id="bed-settings-crop-select"></select>
+    </div>
+    <div class="modal-field">
+      <span>Модуль полива</span>
+      <select id="bed-settings-device-select" onchange="onBedSettingsDeviceChange()"></select>
+    </div>
+    <div class="modal-field">
+      <span>Линия (клапан)</span>
+      <select id="bed-settings-valve-select" onchange="onBedSettingsValveChange()"></select>
+    </div>
+    <div id="bed-settings-hint" style="font-size:0.78em; color:#c0392b; margin-top:6px; display:none;">
+      Нет доступных модулей полива - сначала установите хотя бы один узел полива на
+      вкладке "Устройства".
+    </div>
+    <div id="bed-settings-unknown-count-hint" style="font-size:0.78em; color:#999; margin-top:6px; display:none;">
+      Точное число линий этого модуля пока неизвестно (он ещё не выходил на связь с момента
+      последней перезагрузки Хаба) - показаны все возможные 1..5, уточните номер на месте.
+    </div>
+
+    <div class="settings-section" style="border-top:1px solid #eee; margin-top:14px; padding-top:12px;">
+      <div class="schedule-row-title">Полив</div>
+      <div class="config-row">
+        <label for="bed-settings-interval">Периодичность полива</label>
+        <select id="bed-settings-interval"></select>
+      </div>
+      <div class="config-row">
+        <label for="bed-settings-volume">Объём, л</label>
+        <input type="number" min="0" step="0.1" id="bed-settings-volume">
+      </div>
+      <div class="config-row">
+        <label for="bed-settings-auto">Автополив включён</label>
+        <input type="checkbox" id="bed-settings-auto">
+      </div>
+    </div>
+
+    <div class="modal-actions">
+      <button onclick="saveBedSettings(this)">Сохранить</button>
+      <button class="forget-btn" onclick="deleteBedFromSettings()">Удалить грядку</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // idx -> { el: <DOM-карточка>, installed: bool|null } - хранится между
 // вызовами refresh(), чтобы не пересоздавать DOM-узлы карточек на
@@ -352,6 +518,15 @@ let hubModalOpen = false;
 // комментарий у самих полей в HTML выше.
 let fanInputsInitialized = false;
 
+// id открытой грядки -> DOM-карточка (тот же приём, что и у cardsByIdx выше -
+// не пересоздаём DOM-узлы на каждый тик автообновления).
+let bedCardsById = {};
+
+// id грядки -> последние полученные с Хаба данные (тот же приём, что и у
+// devicesByIdx выше) - нужно, чтобы открыть модалку "Настройки грядки" без
+// отдельного похода в сеть (см. openBedSettingsModal() ниже).
+let bedsByIdx = {};
+
 function openHubModal() {
   hubModalOpen = true;
   document.getElementById('hub-modal-backdrop').classList.add('open');
@@ -360,6 +535,20 @@ function openHubModal() {
 function closeHubModal() {
   hubModalOpen = false;
   document.getElementById('hub-modal-backdrop').classList.remove('open');
+}
+
+// Переключает видимость двух верхнеуовневых блоков (#view-devices/#view-beds) по
+// клику на вкладку (#tab-btn-devices/#tab-btn-beds) - чисто косметическое переключение -
+// оба блока всё равно продолжают обновляться в фоне независимо от того, какой сейчас
+// виден (refresh()/refreshBeds() вызываются по таймеру всегда, см. ниже) - благодаря этому
+// данные на обеих вкладках всегда актуальны, даже если оператор переключается между ними
+// редко.
+function switchView(view) {
+  const isDevices = view === 'devices';
+  document.getElementById('view-devices').style.display = isDevices ? '' : 'none';
+  document.getElementById('view-beds').style.display = isDevices ? 'none' : '';
+  document.getElementById('tab-btn-devices').classList.toggle('active', isDevices);
+  document.getElementById('tab-btn-beds').classList.toggle('active', !isDevices);
 }
 
 function connInfo(agoSec) {
@@ -946,10 +1135,18 @@ document.getElementById('modal-backdrop').addEventListener('click', (e) => {
 document.getElementById('hub-modal-backdrop').addEventListener('click', (e) => {
   if (e.target.id === 'hub-modal-backdrop') closeHubModal();
 });
+document.getElementById('bed-modal-backdrop').addEventListener('click', (e) => {
+  if (e.target.id === 'bed-modal-backdrop') closeBedModal();
+});
+document.getElementById('bed-settings-modal-backdrop').addEventListener('click', (e) => {
+  if (e.target.id === 'bed-settings-modal-backdrop') closeBedSettingsModal();
+});
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   if (openModalIdx !== null) closeModal();
   else if (hubModalOpen) closeHubModal();
+  else if (bedModalOpen) closeBedModal();
+  else if (openBedSettingsId !== null) closeBedSettingsModal();
 });
 
 // Хаб не имеет RTC-модуля с батарейкой - его часы (time()/settimeofday())
@@ -1194,9 +1391,449 @@ async function saveFanThresholds(btn) {
   }
 }
 
+// --- Грядки (вкладка "Грядки") ---
+// Справочник культур - название для отображения и цвет рамки карточки грядки (см.
+// .bed-card в стилях выше). Должен точно совпадать с CropType в hub/BedManager.h (тот же
+// принцип, что и у TX_POWER_OPTIONS/CPU_FREQ_OPTIONS выше - общего enum'а между C++ и JS нет,
+// дублируется вручную). При добавлении новой культуры в будущем - добавить запись сюда и
+// новое значение CropType в BedManager.h.
+const CROP_INFO = {
+  1: { label: 'Огурцы', color: '#4a7c3f' },
+  2: { label: 'Помидоры', color: '#c0392b' },
+  3: { label: 'Малина', color: '#a33a72' },
+};
+
+function cropLabel(cropId) {
+  const info = CROP_INFO[cropId];
+  return info ? info.label : ('Культура ' + cropId);
+}
+
+// Должно точно совпадать с MAX_IRRIGATION_VALVES в hub/IrrigationDevice.h - сколько всего
+// линий могло бы быть на одном модуле - используется как запасной предел числа линий в
+// выпадающем списке, когда точное число (dev.valveCount) ещё неизвестно (то есть равно 0 -
+// модуль ещё ни разу не вышел на связь с момента последней перезагрузки Хаба) - см. большой
+// комментарий у validateBedBinding() в hub.ino, почему это важно.
+const MAX_IRRIGATION_VALVES = 5;
+
+function populateCropOptions(selectEl) {
+  Object.keys(CROP_INFO).forEach((id) => {
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.textContent = CROP_INFO[id].label;
+    selectEl.appendChild(opt);
+  });
+}
+
+function createBedCard(b) {
+  const el = document.createElement('div');
+  el.className = 'bed-card';
+  el.innerHTML =
+    '<button class="bed-gear-btn" title="Настройки грядки">' +
+      '<svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.63c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>' +
+    '</button>' +
+    '<div class="bed-name"></div>' +
+    '<div class="bed-crop"></div>' +
+    '<div class="bed-line"></div>';
+  el.querySelector('.bed-gear-btn').addEventListener('click', () => openBedSettingsModal(b.id));
+  return el;
+}
+
+// Обновляет содержимое карточки грядки. Фон/рамка теперь всегда одинаковы
+// (светло-салатовый, задан в CSS - .bed-card выше), культура больше НЕ влияет на цвет.
+// Описание модуля/линии берётся из уже загруженного devicesByIdx (та же переменная, что и у
+// карточек на вкладке "Устройства") - deviceIdx в b уже разрешён хабом из внутренней
+// привязки по MAC (см. handleApiBeds() в hub.ino) - если устройства с таким idx больше не
+// видно (забыли) - показываем это явно (красным текстом), а не молча показываем сырой idx.
+function updateBedCard(el, b) {
+  el.querySelector('.bed-name').textContent = b.name && b.name.length > 0 ? b.name : ('Грядка #' + b.id);
+  el.querySelector('.bed-crop').textContent = cropLabel(b.cropId);
+
+  const dev = devicesByIdx[b.deviceIdx];
+  const lineEl = el.querySelector('.bed-line');
+  if (dev) {
+    const devName = (dev.name && dev.name.length > 0) ? dev.name : ('Узел #' + b.deviceIdx);
+    lineEl.textContent = devName + ' · линия ' + b.valve;
+    lineEl.classList.remove('bed-line-missing');
+  } else {
+    lineEl.textContent = 'Модуль #' + b.deviceIdx + ' не найден (забыт/переустановлен)';
+    lineEl.classList.add('bed-line-missing');
+  }
+}
+
+async function refreshBeds() {
+  try {
+    const res = await fetch('/api/beds');
+    const beds = await res.json();
+    const grid = document.getElementById('beds-grid');
+
+    if (beds.length === 0) {
+      grid.innerHTML = '<div class="empty">Грядок пока нет</div>';
+      bedCardsById = {};
+      bedsByIdx = {};
+      return;
+    }
+
+    if (Object.keys(bedCardsById).length === 0) {
+      grid.innerHTML = '';
+    }
+
+    bedsByIdx = {};
+    const seenIds = new Set();
+    beds.forEach((b) => {
+      bedsByIdx[b.id] = b;
+      seenIds.add(b.id);
+      let card = bedCardsById[b.id];
+      if (!card) {
+        card = createBedCard(b);
+        grid.appendChild(card);
+        bedCardsById[b.id] = card;
+      }
+      updateBedCard(card, b);
+    });
+
+    Object.keys(bedCardsById).forEach((idStr) => {
+      const id = Number(idStr);
+      if (!seenIds.has(id)) {
+        bedCardsById[id].remove();
+        delete bedCardsById[id];
+      }
+    });
+  } catch (e) {
+    console.error('Не удалось обновить список грядок', e);
+  }
+}
+
+// Аналогично hubModalOpen выше - свой флаг для модалки создания грядки, чтобы Escape
+// знал, какую из модалок закрывать (см. обработчик keydown выше).
+let bedModalOpen = false;
+
+// Строит список доступных модулей полива для привязки грядки - ВСЕ УСТАНОВЛЕННЫЕ узлы полива
+// (type===1 && installed) НЕЗАВИСИМО от того, подтвердил ли уже модуль свой valveCount (то есть был ли
+// он хотя бы раз на связи с момента последней перезагрузки Хаба) - оператор должен иметь
+// возможность привязать грядку к установленному модулю независимо от того, на связи ли он сейчас
+// (та же логика, что и в validateBedBinding() в hub.ino) - число линий в выпадающем списке для
+// таких узлов берётся из запасного MAX_IRRIGATION_VALVES (см. updateBedValveOptions() ниже).
+function populateBedDeviceOptions() {
+  const select = document.getElementById('bed-device-select');
+  select.innerHTML = '';
+  const candidates = Object.values(devicesByIdx).filter((d) => d.type === 1 && d.installed);
+  candidates.forEach((d) => {
+    const opt = document.createElement('option');
+    opt.value = d.idx;
+    opt.textContent = (d.name && d.name.length > 0) ? d.name : ('Узел #' + d.idx);
+    select.appendChild(opt);
+  });
+
+  const hint = document.getElementById('bed-modal-hint');
+  const saveBtn = document.getElementById('bed-save-btn');
+  const noCandidates = candidates.length === 0;
+  hint.style.display = noCandidates ? '' : 'none';
+  saveBtn.disabled = noCandidates;
+  select.disabled = noCandidates;
+
+  updateBedValveOptions();
+}
+
+// Возвращает Set номеров линий (клапанов) устройства deviceIdx, уже занятых ДРУГИМИ
+// грядками - используется, чтобы задизейблить такие варианты в выпадающем списке линии
+// (см. updateBedValveOptions()/onBedSettingsDeviceChange() ниже), поскольку одна линия
+// физически поливает один участок - повторная привязка второй грядки к той же линии,
+// скорее всего, ошибка оператора, а не осознанный выбор. excludeBedId (если передан) -
+// исключить эту грядку из подсчёта, чтобы при РЕДАКТИРОВАНИИ грядка не считала СВОЮ ЖЕ
+// текущую линию "занятой" (см. вызов из onBedSettingsDeviceChange()).
+function takenValves(deviceIdx, excludeBedId) {
+  const taken = new Set();
+  Object.values(bedsByIdx).forEach((b) => {
+    if (excludeBedId !== undefined && b.id === excludeBedId) return;
+    if (String(b.deviceIdx) === String(deviceIdx)) taken.add(b.valve);
+  });
+  return taken;
+}
+
+// Заполняет <select> линий вариантами 1..valveCount, помечая уже занятые другими
+// грядками (см. takenValves() выше) как disabled - и выбирает по умолчанию первую
+// свободную линию, а не полагается на то, что браузер сам пропустит задизейбленный
+// первый <option> (это не гарантировано во всех браузерах, если ни у одного option нет
+// явного атрибута selected). preselectValve (если передан и сам не занят - актуально
+// при редактировании грядки, её собственная текущая линия уже исключена из taken через
+// excludeBedId у вызывающей стороны) переопределяет выбор первой свободной.
+function populateValveOptions(selectEl, valveCount, taken, preselectValve) {
+  selectEl.innerHTML = '';
+  let firstFreeValue = null;
+  for (let v = 1; v <= valveCount; v++) {
+    const opt = document.createElement('option');
+    opt.value = v;
+    const isTaken = taken.has(v);
+    opt.textContent = 'Линия ' + v + (isTaken ? ' (занята другой грядкой)' : '');
+    opt.disabled = isTaken;
+    selectEl.appendChild(opt);
+    if (!isTaken && firstFreeValue === null) firstFreeValue = v;
+  }
+  if (firstFreeValue !== null) selectEl.value = firstFreeValue;
+  if (preselectValve && preselectValve >= 1 && preselectValve <= valveCount && !taken.has(preselectValve)) {
+    selectEl.value = preselectValve;
+  }
+}
+
+// Перестраивает список линий (#bed-valve-select) под текущий выбор модуля
+// (#bed-device-select) - вызывается при открытии модалки (из populateBedDeviceOptions() выше) и при
+// смене модуля оператором (onchange в разметке выше).
+function updateBedValveOptions() {
+  const deviceSelect = document.getElementById('bed-device-select');
+  const valveSelect = document.getElementById('bed-valve-select');
+  const unknownHint = document.getElementById('bed-modal-unknown-count-hint');
+  valveSelect.innerHTML = '';
+  if (deviceSelect.options.length === 0) {
+    unknownHint.style.display = 'none';
+    return;
+  }
+
+  const dev = devicesByIdx[deviceSelect.value];
+  const countUnknown = !dev || !(dev.valveCount > 0);
+  unknownHint.style.display = countUnknown ? '' : 'none';
+  // valveCount==0 - модуль ещё ни разу не вышел на связь с момента последней перезагрузки
+  // Хаба - тогда вместо ещё неизвестного точного числа линий берётся запасной
+  // MAX_IRRIGATION_VALVES (см. большой комментарий у populateBedDeviceOptions() выше).
+  const valveCount = countUnknown ? MAX_IRRIGATION_VALVES : dev.valveCount;
+  // Создаётся новая грядка - excludeBedId не нужен, ни одна из существующих грядок
+  // не является "этой же" редактируемой.
+  populateValveOptions(valveSelect, valveCount, takenValves(deviceSelect.value));
+}
+
+function openAddBedModal() {
+  bedModalOpen = true;
+  document.getElementById('bed-name-input').value = '';
+  const cropSelect = document.getElementById('bed-crop-select');
+  if (cropSelect.options.length === 0) populateCropOptions(cropSelect);
+  cropSelect.selectedIndex = 0;
+  populateBedDeviceOptions();
+  document.getElementById('bed-modal-backdrop').classList.add('open');
+}
+
+function closeBedModal() {
+  bedModalOpen = false;
+  document.getElementById('bed-modal-backdrop').classList.remove('open');
+}
+
+async function saveNewBed(btn) {
+  const name = document.getElementById('bed-name-input').value.trim();
+  if (name.length === 0) {
+    flashButton(btn, '✗ Введите название', false);
+    return;
+  }
+  const cropId = document.getElementById('bed-crop-select').value;
+  const deviceSelect = document.getElementById('bed-device-select');
+  const valveSelect = document.getElementById('bed-valve-select');
+  if (!deviceSelect.value || !valveSelect.value) {
+    flashButton(btn, '✗ Нет доступной линии', false);
+    return;
+  }
+  try {
+    const res = await fetch('/api/addBed', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'name=' + encodeURIComponent(name) + '&cropId=' + cropId +
+            '&deviceIdx=' + deviceSelect.value + '&valve=' + valveSelect.value
+    });
+    if (res.ok) {
+      closeBedModal();
+      refreshBeds();
+    } else if (res.status === 409) {
+      flashButton(btn, '✗ Линия уже занята', false);
+    } else {
+      flashButton(btn, '✗ Ошибка', false);
+    }
+  } catch (e) {
+    flashButton(btn, '✗ Ошибка', false);
+  }
+}
+
+async function deleteBedFromSettings() {
+  if (openBedSettingsId === null) return;
+  if (!confirm('Удалить эту грядку? Модуль полива и его настройки это не затронет.')) return;
+  await fetch('/api/deleteBed', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body: 'id=' + openBedSettingsId
+  });
+  closeBedSettingsModal();
+  refreshBeds();
+}
+
+// Аналогично openBedSettingsId выше - аналог hubModalOpen/bedModalOpen выше, чтобы Escape знал,
+// какую из трёх модалок закрывать (см. обработчик keydown выше). null - модалка закрыта,
+// иначе - id грядки, которая сейчас редактируется.
+let openBedSettingsId = null;
+
+// Строит список доступных модулей полива для модалки настроек - та же выборка, что и у
+// populateBedDeviceOptions() выше (все установленные узлы полива независимо от того, подтверждён ли уже
+// их valveCount), но в свой собственные поля и с предвыбором текущего модуля/линии грядки b.
+// Если текущий привязанный модуль больше не в списке кандидатов (забыт, b.deviceIdx===-1) -
+// оставляем выбранным первый из доступных (оператору всё равно придётся явно выбрать
+// новую привязку, если старая больше недоступна).
+function populateBedSettingsDeviceOptions(b) {
+  const select = document.getElementById('bed-settings-device-select');
+  select.innerHTML = '';
+  const candidates = Object.values(devicesByIdx).filter((d) => d.type === 1 && d.installed);
+  candidates.forEach((d) => {
+    const opt = document.createElement('option');
+    opt.value = d.idx;
+    opt.textContent = (d.name && d.name.length > 0) ? d.name : ('Узел #' + d.idx);
+    select.appendChild(opt);
+  });
+
+  const hint = document.getElementById('bed-settings-hint');
+  const noCandidates = candidates.length === 0;
+  hint.style.display = noCandidates ? '' : 'none';
+  select.disabled = noCandidates;
+
+  if (noCandidates) {
+    onBedSettingsDeviceChange(null);
+    return;
+  }
+
+  const wanted = String(b.deviceIdx);
+  const hasWanted = candidates.some((d) => String(d.idx) === wanted);
+  select.value = hasWanted ? wanted : select.options[0].value;
+
+  onBedSettingsDeviceChange(hasWanted ? b.valve : null);
+}
+
+// Перестраивает список линий (#bed-settings-valve-select) под текущий выбор модуля
+// (#bed-settings-device-select) - вызывается как при открытии модалки (с preselectValve из
+// текущей привязки грядки), так и при смене модуля оператором (onchange в разметке, без
+// аргумента - тогда просто выбирается первая линия нового модуля). В любом случае затем
+// перестраивает поля полива (периодичность/объём/авто) под текущий модуль+линию - см.
+// onBedSettingsValveChange() ниже.
+function onBedSettingsDeviceChange(preselectValve) {
+  const deviceSelect = document.getElementById('bed-settings-device-select');
+  const valveSelect = document.getElementById('bed-settings-valve-select');
+  const unknownHint = document.getElementById('bed-settings-unknown-count-hint');
+  valveSelect.innerHTML = '';
+  if (deviceSelect.options.length === 0) {
+    unknownHint.style.display = 'none';
+    renderBedScheduleFields(null, null);
+    return;
+  }
+
+  const dev = devicesByIdx[deviceSelect.value];
+  const countUnknown = !dev || !(dev.valveCount > 0);
+  unknownHint.style.display = countUnknown ? '' : 'none';
+  // valveCount==0 - модуль ещё ни разу не вышел на связь с момента последней перезагрузки
+  // Хаба - тогда вместо ещё неизвестного точного числа линий берётся запасной
+  // MAX_IRRIGATION_VALVES (см. большой комментарий у populateBedDeviceOptions() выше).
+  const valveCount = countUnknown ? MAX_IRRIGATION_VALVES : dev.valveCount;
+  // Редактируемая грядка (openBedSettingsId) исключается из подсчёта занятых
+  // линий - иначе её собственная текущая линия всегда показывалась бы занятой сама собой.
+  populateValveOptions(valveSelect, valveCount, takenValves(deviceSelect.value, openBedSettingsId), preselectValve);
+  onBedSettingsValveChange();
+}
+
+// Перестраивает поля секции "Полив" под текущий выбор модуля+линии - вызывается при onchange
+// #bed-settings-valve-select и из onBedSettingsDeviceChange() выше при смене модуля.
+function onBedSettingsValveChange() {
+  const deviceSelect = document.getElementById('bed-settings-device-select');
+  const valveSelect = document.getElementById('bed-settings-valve-select');
+  const dev = devicesByIdx[deviceSelect.value];
+  const valve = Number(valveSelect.value);
+  renderBedScheduleFields(dev, valve);
+}
+
+// Заполняет поля периодичности/объёма/автополива в модалке "Настройки грядки" из уже
+// загруженного dev.valveSchedules[valve-1] (тот же формат, что и в секции "Настройка"
+// модалки устройства, см. buildIrrigationTypeSpecific() выше) - без отдельного сетевого запроса,
+// данные уже есть в devicesByIdx (пришли с очередным refresh()). dev/valve могут быть
+// null (нет ни одного доступного модуля) - тогда поля просто сбрасываются к безопасным дефолтам.
+function renderBedScheduleFields(dev, valve) {
+  const intervalSelect = document.getElementById('bed-settings-interval');
+  const volumeInput = document.getElementById('bed-settings-volume');
+  const autoInput = document.getElementById('bed-settings-auto');
+
+  if (!dev || !valve) {
+    intervalSelect.innerHTML = intervalDaysOptions(1);
+    volumeInput.value = '0.0';
+    autoInput.checked = false;
+    return;
+  }
+  const sched = (dev.valveSchedules && dev.valveSchedules[valve - 1]) || { intervalDays: 1, volumeL: 0, autoEnabled: false };
+  intervalSelect.innerHTML = intervalDaysOptions(sched.intervalDays);
+  volumeInput.value = sched.volumeL.toFixed(1);
+  autoInput.checked = !!sched.autoEnabled;
+}
+
+function openBedSettingsModal(id) {
+  const b = bedsByIdx[id];
+  if (!b) return;
+  openBedSettingsId = id;
+  document.getElementById('bed-settings-name-input').value = b.name || '';
+  const cropSelect = document.getElementById('bed-settings-crop-select');
+  if (cropSelect.options.length === 0) populateCropOptions(cropSelect);
+  cropSelect.value = b.cropId;
+  populateBedSettingsDeviceOptions(b);
+  document.getElementById('bed-settings-modal-backdrop').classList.add('open');
+}
+
+function closeBedSettingsModal() {
+  openBedSettingsId = null;
+  document.getElementById('bed-settings-modal-backdrop').classList.remove('open');
+}
+
+// Сохраняет одной кнопкой сразу две вещи: привязку грядки (POST /api/updateBed) и
+// настройки автополива текущей выбранной линии (POST /api/setValveSchedule, тот же эндпоинт,
+// что и у saveValveSchedule() выше) - для оператора это одно действие "Сохранить", поэтому
+// оба запроса должны выполниться успешно оба, чтобы считать общий результат успешным.
+async function saveBedSettings(btn) {
+  if (openBedSettingsId === null) return;
+  const name = document.getElementById('bed-settings-name-input').value.trim();
+  if (name.length === 0) {
+    flashButton(btn, '✗ Введите название', false);
+    return;
+  }
+  const cropId = document.getElementById('bed-settings-crop-select').value;
+  const deviceSelect = document.getElementById('bed-settings-device-select');
+  const valveSelect = document.getElementById('bed-settings-valve-select');
+  if (!deviceSelect.value || !valveSelect.value) {
+    flashButton(btn, '✗ Нет доступной линии', false);
+    return;
+  }
+  const deviceIdx = deviceSelect.value;
+  const valve = valveSelect.value;
+  const interval = document.getElementById('bed-settings-interval').value;
+  const volume = document.getElementById('bed-settings-volume').value;
+  const autoEnabled = document.getElementById('bed-settings-auto').checked ? 1 : 0;
+
+  try {
+    const bindRes = await fetch('/api/updateBed', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'id=' + openBedSettingsId + '&name=' + encodeURIComponent(name) + '&cropId=' + cropId +
+            '&deviceIdx=' + deviceIdx + '&valve=' + valve
+    });
+    const schedRes = await fetch('/api/setValveSchedule', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'idx=' + deviceIdx + '&valve=' + valve + '&intervalDays=' + interval +
+            '&volumeL=' + volume + '&autoEnabled=' + autoEnabled
+    });
+    if (bindRes.ok && schedRes.ok) {
+      closeBedSettingsModal();
+      refresh();
+      refreshBeds();
+    } else if (bindRes.status === 409) {
+      flashButton(btn, '✗ Линия уже занята', false);
+    } else {
+      flashButton(btn, '✗ Ошибка', false);
+    }
+  } catch (e) {
+    flashButton(btn, '✗ Ошибка', false);
+  }
+}
+
 syncTime();
 refresh();
+refreshBeds();
 setInterval(refresh, 2000);
+setInterval(refreshBeds, 2000);
 setInterval(refreshStatus, 2000);
 // Периодическая пересинхронизация: часы ESP32 без внешнего RTC понемногу
 // уходят (обычный дрейф кварцевого генератора). Раз в 30 минут, пока
