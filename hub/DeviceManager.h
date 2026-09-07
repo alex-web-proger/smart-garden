@@ -135,17 +135,20 @@ public:
     // установленных устройств в NVS, как install()/forget().
     bool setName(int idx, const char *newName);
 
-    // Задать настройки автополива одного клапана (периодичность/объём/вкл/выкл) - симметрично
-    // setName() выше: ТОЛЬКО для уже установленного устройства типа TYPE_IRRIGATION - для кандидата
-    // или устройства другого типа нет смысла хранить такие настройки. valve - номер клапана
+    // Задать настройки автополива одного клапана (периодичность/объём/продолжительность/вкл-выкл) -
+    // симметрично setName() выше: ТОЛЬКО для уже установленного устройства типа TYPE_IRRIGATION - для
+    // кандидата или устройства другого типа нет смысла хранить такие настройки. valve - номер клапана
     // (1..MAX_IRRIGATION_VALVES, см. IrrigationDevice.h), intervalDays - 1..7, volumeDl - объём в десятых
     // литра (то есть уже переведённый из десятичного числа с веб-формы - см. handleApiSetValveSchedule()
-    // в hub.ino, который делает этот пересчёт). false, если idx не существует, устройство не
-    // установлено, не TYPE_IRRIGATION, или valve/intervalDays вне допустимых диапазонов. Сохраняет
-    // весь список установленных устройств в NVS, как install()/forget()/setName() выше. В ОТЛИЧИЕ от
-    // sendSetConfig() в hub.ino - НИЧЕГО не отправляет узлу по ESP-NOW, чисто локальная настройка
-    // Хаба (см. большой комментарий у ValveSchedule в IrrigationDevice.h).
-    bool setValveSchedule(int idx, int valve, uint8_t intervalDays, uint16_t volumeDl, bool autoEnabled);
+    // в hub.ino, который делает этот пересчёт), durationSec - продолжительность в секундах. ОБА
+    // (volumeDl И durationSec) сохраняются ВСЕГДА, независимо от текущего mode устройства - какое из
+    // них ИМЕЕТ СМЫСЛ, решает веб-страница при отображении (см. большой комментарий у ValveSchedule в
+    // IrrigationDevice.h). false, если idx не существует, устройство не установлено, не TYPE_IRRIGATION,
+    // или valve/intervalDays вне допустимых диапазонов. Сохраняет весь список установленных устройств
+    // в NVS, как install()/forget()/setName() выше. В ОТЛИЧИЕ от sendSetConfig() в hub.ino - НИЧЕГО не
+    // отправляет узлу по ESP-NOW, чисто локальная настройка Хаба (см. большой комментарий у
+    // ValveSchedule в IrrigationDevice.h).
+    bool setValveSchedule(int idx, int valve, uint8_t intervalDays, uint16_t volumeDl, uint16_t durationSec, bool autoEnabled);
 
     // true, если idx указывает на существующую запись (слот занят).
     bool isValid(int idx) const;

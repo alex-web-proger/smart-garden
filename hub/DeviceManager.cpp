@@ -222,7 +222,7 @@ bool DeviceManager::setName(int idx, const char *newName) {
     return true;
 }
 
-bool DeviceManager::setValveSchedule(int idx, int valve, uint8_t intervalDays, uint16_t volumeDl, bool autoEnabled) {
+bool DeviceManager::setValveSchedule(int idx, int valve, uint8_t intervalDays, uint16_t volumeDl, uint16_t durationSec, bool autoEnabled) {
     if (!isValid(idx) || !devices[idx]->installed) return false;
     if (devices[idx]->deviceType != TYPE_IRRIGATION) return false;
     if (valve < 1 || valve > MAX_IRRIGATION_VALVES) return false;
@@ -232,6 +232,7 @@ bool DeviceManager::setValveSchedule(int idx, int valve, uint8_t intervalDays, u
     ValveSchedule &sched = irr->valveSchedules[valve - 1];
     sched.intervalDays = intervalDays;
     sched.volumeDl = volumeDl;
+    sched.durationSec = durationSec;
     sched.autoEnabled = autoEnabled ? 1 : 0;
     saveToNVS();
     return true;

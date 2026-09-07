@@ -39,7 +39,10 @@
 // сворачиваемая (по умолчанию закрыта)
 // секция "Настройка" (id="modal-settings-section") - по одному блоку на каждый клапан (в
 // пределах текущего valveCount) с тремя полями: периодичность полива (выпадающий список
-// "Раз в N дней", 1..7), объём за один полив в литрах (до десятых) и чекбокс "Автополив
+// "Раз в N дней", 1..7), объём ЗА ОДИН ПОЛИВ ИЛИ ПРОДОЛЖИТЕЛЬНОСТЬ (одно из двух, какое
+// именно - решает текущий режим устройства: mode==3 - объём в литрах до десятых, иначе
+// (mode==1/2) - продолжительность в секундах, см. большой комментарий у ValveSchedule в
+// hub/IrrigationDevice.h) и чекбокс "Автополив
 // включён". В ОТЛИЧИЕ от "Конфигурации модуля" ниже, эти настройки ПОЛНОСТЬЮ локальны для
 // Хаба и НЕ отправляются узлу по ESP-NOW вообще - только сохраняются в NVS САМОГО ХАБА
 // (POST /api/setValveSchedule -> DeviceManager::setValveSchedule(), см. hub.ino/DeviceManager.h/.cpp
@@ -155,8 +158,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .bed-gear-btn:active svg { fill:#2f4a24; }
 
   /* --- Круглая кнопка РУЧНОГО включения/выключения полива грядки - переключает РОВНО ТУ
-     линию, к которой привязана грядка (см. toggleBedIrrigation() в скрипте, использует ту же
-     sendCmd(), что и кнопки "Открыть"/"Закрыть" в модалке устройства). Цвет отражает текущее
+     линию, к которой привязана грядка, на время/объём из её СОБСТВЕННОГО расписания (см.
+     toggleBedIrrigation() в скрипте, использует ту же sendCmd(), что и кнопки "Открыть"/"Закрыть" в
+     модалке устройства). Цвет отражает текущее
      состояние (зелёный - открыт, серый - закрыт), а не действие кнопки - тот же принцип, что и у
      .valve-state.open/.closed в модалке устройства. Задизейблена (тускло-серая), если модуль
      сейчас не резолвится (забыт) - см. updateBedCard() в скрипте. */
@@ -442,10 +446,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
      культура/модуль/линия) повторяет модалку создания выше, но в своих собственных полях
      (отдельный набор id, чтобы обе модалки могли быть открыты независимо). Ниже -
      секция "Полив" с ТЕМИ ЖЕ полями, что и в секции "Настройка" модалки устройства (id="modal-settings-section"
-     выше) - периодичность/объём/автополив, но для РОВНО ОДНОЙ (текущей выбранной выше) линии,
-     а не по одной строке на каждый клапан модуля - грядка привязана ровно к одной линии, показывать
+     выше) - периодичность/количество (объём ИЛИ продолжительность - какое именно, зависит от текущего режима
+     привязанного модуля - см. большой комментарий у ValveSchedule в hub/IrrigationDevice.h)/автополив, но для РОВНО ОДНОЙ
+     (текущей выбранной выше) линии, а не по одной строке на каждый клапан модуля - грядка привязана ровно к одной линии, показывать
      остальные здесь бессмысленно. Поля перезаполняются из devicesByIdx[...].valveSchedules при
-     открытии и при каждой смене модуля/линии (см. renderBedScheduleFields() в скрипте), а
+     открытии и при каждой смене модуля/линии (см. renderBedScheduleFields() в скрипте, там же - переключение
+     видимости между #bed-settings-volume-row/#bed-settings-duration-row), а
      сохраняются одной общей кнопкой "Сохранить" вместе с привязкой (см. saveBedSettings() в
      скрипте - два POST-запроса подряд, но для оператора это одно действие). -->
 <div class="modal-backdrop" id="bed-settings-modal-backdrop">
@@ -485,9 +491,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <label for="bed-settings-interval">Периодичность полива</label>
         <select id="bed-settings-interval"></select>
       </div>
-      <div class="config-row">
+      <div class="config-row" id="bed-settings-volume-row">
         <label for="bed-settings-volume">Объём, л</label>
         <input type="number" min="0" step="0.1" id="bed-settings-volume">
+      </div>
+      <div class="config-row" id="bed-settings-duration-row" style="display:none;">
+        <label for="bed-settings-duration">Продолжительность, сек</label>
+        <input type="number" min="1" id="bed-settings-duration">
       </div>
       <div class="config-row">
         <label for="bed-settings-auto">Автополив включён</label>
@@ -801,17 +811,34 @@ function buildIrrigationTypeSpecific(d) {
   // секции "Управление" выше. При пересборке (needsRebuild в updateModal()) текущие
   // значения в полях (если они уже есть в DOM) сохраняются - тот же принцип, что и у
   // modal-cfg-* ниже, чтобы случайная пересборка (например, из-за смены hasFlowSensor) не стерла
-  // несохранённый ввод оператора.
+  // несохранённый ввод оператора. Поле КОЛИЧЕСТВА полива - ОДНО ИЗ ДВУХ (объём ИЛИ
+  // продолжительность), какое именно - решает ТЕКУЩИЙ d.mode устройства (см. большой
+  // комментарий у ValveSchedule в hub/IrrigationDevice.h) - тот же принцип переключения, что и у
+  // поля в самой секции "Управление" выше (см. buildIrrigationTypeSpecific() выше по файлу,
+  // блок duration-row/modal-dose-volume) - тут просто НА КАЖДЫЙ КЛАПАН СВОЁ ПОЛЕ, а не одно общее.
   let scheduleRows = '';
   for (let v = 1; v <= d.valveCount; v++) {
-    const sched = (d.valveSchedules && d.valveSchedules[v - 1]) || { intervalDays: 1, volumeL: 0, autoEnabled: false };
+    const sched = (d.valveSchedules && d.valveSchedules[v - 1]) || { intervalDays: 1, volumeL: 0, durationSec: 0, autoEnabled: false };
 
     const existingInterval = document.getElementById('schedule-interval-' + v);
     const intervalValue = existingInterval ? existingInterval.value : sched.intervalDays;
     const existingVolume = document.getElementById('schedule-volume-' + v);
     const volumeValue = existingVolume ? existingVolume.value : sched.volumeL.toFixed(1);
+    const existingDuration = document.getElementById('schedule-duration-' + v);
+    const durationValue = existingDuration ? existingDuration.value : sched.durationSec;
     const existingAuto = document.getElementById('schedule-auto-' + v);
     const autoChecked = existingAuto ? existingAuto.checked : !!sched.autoEnabled;
+
+    // mode===3 (точное дозирование) - объём, иначе (эксклюзивный/независимый) - продолжительность.
+    const amountRow = d.mode === 3
+      ? ('<div class="config-row">' +
+           '<label for="schedule-volume-' + v + '">Объём, л</label>' +
+           '<input type="number" min="0" step="0.1" id="schedule-volume-' + v + '" value="' + volumeValue + '">' +
+         '</div>')
+      : ('<div class="config-row">' +
+           '<label for="schedule-duration-' + v + '">Продолжительность, сек</label>' +
+           '<input type="number" min="1" id="schedule-duration-' + v + '" value="' + durationValue + '">' +
+         '</div>');
 
     scheduleRows +=
       '<div class="schedule-row" id="schedule-row-' + v + '">' +
@@ -820,10 +847,7 @@ function buildIrrigationTypeSpecific(d) {
           '<label for="schedule-interval-' + v + '">Периодичность полива</label>' +
           '<select id="schedule-interval-' + v + '">' + intervalDaysOptions(intervalValue) + '</select>' +
         '</div>' +
-        '<div class="config-row">' +
-          '<label for="schedule-volume-' + v + '">Объём, л</label>' +
-          '<input type="number" min="0" step="0.1" id="schedule-volume-' + v + '" value="' + volumeValue + '">' +
-        '</div>' +
+        amountRow +
         '<div class="config-row">' +
           '<label for="schedule-auto-' + v + '">Автополив включён</label>' +
           '<input type="checkbox" id="schedule-auto-' + v + '"' + (autoChecked ? ' checked' : '') + '>' +
@@ -1053,16 +1077,30 @@ function intervalDaysOptions(selected) {
 // ниже НИЧЕГО не отправляется узлу, поэтому результат применяется/подтверждается
 // СРАЗУ, без ожидания асинхронного ответа от узла). Отдельная кнопка на каждый клапан (а не
 // одна общая на всю секцию) - оператор может править и сохранять каждую линию независимо.
+// В ФОРМЕ ПРИСУТСТВУЕТ ТОЛЬКО ОДИН из двух входов количества полива (schedule-volume-*/
+// schedule-duration-*, см. buildIrrigationTypeSpecific() выше и большой комментарий у
+// ValveSchedule в hub/IrrigationDevice.h) - в зависимости от текущего режима устройства -
+// но API всё равно требует ОБА значения сразу (см. handleApiSetValveSchedule()) - за то, которое
+// сейчас НЕ показано оператору (нет соответствующего <input> в DOM), подставляется последнее
+// известное значение из devicesByIdx (то есть оно просто отправляется обратно тем же, что и
+// пришло, а НЕ обнуляется/теряется).
 async function saveValveSchedule(btn, idx, valve) {
   const interval = document.getElementById('schedule-interval-' + valve).value;
-  const volume = document.getElementById('schedule-volume-' + valve).value;
   const autoEnabled = document.getElementById('schedule-auto-' + valve).checked ? 1 : 0;
+
+  const dev = devicesByIdx[idx];
+  const sched = (dev && dev.valveSchedules && dev.valveSchedules[valve - 1]) || { volumeL: 0, durationSec: 0 };
+  const volumeInput = document.getElementById('schedule-volume-' + valve);
+  const durationInput = document.getElementById('schedule-duration-' + valve);
+  const volume = volumeInput ? volumeInput.value : sched.volumeL;
+  const duration = durationInput ? durationInput.value : sched.durationSec;
+
   try {
     const res = await fetch('/api/setValveSchedule', {
       method: 'POST',
       headers: {'Content-Type': 'application/x-www-form-urlencoded'},
       body: 'idx=' + idx + '&valve=' + valve + '&intervalDays=' + interval +
-            '&volumeL=' + volume + '&autoEnabled=' + autoEnabled
+            '&volumeL=' + volume + '&durationSec=' + duration + '&autoEnabled=' + autoEnabled
     });
     flashButton(btn, res.ok ? '✓' : '✗', res.ok);
   } catch (e) {
@@ -1501,11 +1539,18 @@ function updateBedCard(el, b) {
 // РОВНО ТУ линию, к которой привязана грядка - использует ту же sendCmd(), что и кнопки
 // "Открыть"/"Закрыть" в модалке устройства (см. valveButtonClick() выше) - тот же принцип
 // выбора режима: если у модуля включено точное дозирование (mode===3), открытие шлёт как
-// доза на объём из собственного расписания грядки (dev.valveSchedules[b.valve-1].volumeL, то же "Объём, л"
-// из её модалки настроек), иначе - просто открывается без ограничения (duration всё равно пока
-// ничем не управляется на самом узле, см. комментарий в onCommand() в flow_node.ino) - оператор закрывает
-// вручную этой же кнопкой повторно. ВНИМАНИЕ: в режиме 1 (эксклюзивный) открытие этой линии закроет
-// все остальные клапаны этого же модуля (в том числе линии других грядок на нём) - то же самое
+// дозу на объём из собственного расписания грядки (dev.valveSchedules[b.valve-1].volumeL, то же "Объём, л"
+// из её модалки настроек), иначе (mode==1/2) - открывается НА ЗАДАННУЮ ТАМ ЖЕ
+// ПРОДОЛЖИТЕЛЬНОСТЬ (dev.valveSchedules[b.valve-1].durationSec, то же "Продолжительность, сек"
+// из её модалки настроек, см. большой комментарий у ValveSchedule в hub/IrrigationDevice.h) - если
+// оператор ещё ни разу не сохранял продолжительность (равна 0) - берётся запасная 60 секунд,
+// чтобы кнопка всё равно делала что-то осмысленное, а не открывала клапан на 0 секунд (тот же
+// принцип, что и у запасного 1.0 л для объёма выше). ПРИМЕЧАНИЕ: duration_sec СЕЙЧАС НИЧЕМ
+// не ограничивает реальное открытие клапана на самом узле (планировщик автополива по расписанию ещё
+// не реализован, см. onCommand() в flow_node.ino) - здесь оно всё равно отправляется вместе с
+// командой - когда ограничение по времени появится на узле, кнопка уже будет отправлять правильное
+// значение без дополнительных изменений здесь. ВНИМАНИЕ: в режиме 1 (эксклюзивный) открытие
+// этой линии закроет все остальные клапаны этого же модуля (в том числе линии других грядок на нём) - то же самое
 // поведение, что и у кнопок клапанов в модалке устройства, ничего особо не добавлено. Кнопка и так
 // задизейблена, если модуль не резолвится (см. updateBedCard() выше), так что отдельная проверка здесь -
 // только на всякий случай.
@@ -1518,12 +1563,15 @@ async function toggleBedIrrigation(id) {
   const isOpen = ((dev.activeValvesMask >> (b.valve - 1)) & 1) === 1;
   if (isOpen) {
     await sendCmd(b.deviceIdx, b.valve, 1, 0, 0, 0);
-  } else if (dev.mode === 3) {
-    const sched = dev.valveSchedules && dev.valveSchedules[b.valve - 1];
-    const liters = (sched && sched.volumeL > 0) ? sched.volumeL : 1.0;
-    await sendCmd(b.deviceIdx, b.valve, 0, 2, 0, liters);
   } else {
-    await sendCmd(b.deviceIdx, b.valve, 0, 0, 0, 0);
+    const sched = dev.valveSchedules && dev.valveSchedules[b.valve - 1];
+    if (dev.mode === 3) {
+      const liters = (sched && sched.volumeL > 0) ? sched.volumeL : 1.0;
+      await sendCmd(b.deviceIdx, b.valve, 0, 2, 0, liters);
+    } else {
+      const sec = (sched && sched.durationSec > 0) ? sched.durationSec : 60;
+      await sendCmd(b.deviceIdx, b.valve, 0, 0, sec, 0);
+    }
   }
   // sendCmd() уже планирует refresh() через 300 мс (он обновляет devicesByIdx, откуда берётся
   // состояние этой кнопки) - добавляем свой чуть позже refreshBeds(), чтобы карточка
@@ -1811,26 +1859,43 @@ function onBedSettingsValveChange() {
   renderBedScheduleFields(dev, valve);
 }
 
-// Заполняет поля периодичности/объёма/автополива в модалке "Настройки грядки" из уже
-// загруженного dev.valveSchedules[valve-1] (тот же формат, что и в секции "Настройка"
+// Заполняет поля периодичности/объёма-или-продолжительности/автополива в модалке "Настройки грядки"
+// из уже загруженного dev.valveSchedules[valve-1] (тот же формат, что и в секции "Настройка"
 // модалки устройства, см. buildIrrigationTypeSpecific() выше) - без отдельного сетевого запроса,
 // данные уже есть в devicesByIdx (пришли с очередным refresh()). dev/valve могут быть
 // null (нет ни одного доступного модуля) - тогда поля просто сбрасываются к безопасным дефолтам.
+// КАКОЕ ИЗ ДВУХ полей количества (#bed-settings-volume-row/#bed-settings-duration-row) показать -
+// решает ТЕКУЩИЙ режим dev.mode (тот же принцип, что и у buildIrrigationTypeSpecific() выше -
+// mode===3 - объём, иначе - продолжительность, см. большой комментарий у ValveSchedule в
+// hub/IrrigationDevice.h) - ОБА поля всё равно заполняются значениями из sched (а не только
+// видимое), чтобы saveBedSettings() ниже могла взять значение скрытого поля напрямую из
+// DOM, без дополнительного обращения к devicesByIdx там же.
 function renderBedScheduleFields(dev, valve) {
   const intervalSelect = document.getElementById('bed-settings-interval');
   const volumeInput = document.getElementById('bed-settings-volume');
+  const durationInput = document.getElementById('bed-settings-duration');
+  const volumeRow = document.getElementById('bed-settings-volume-row');
+  const durationRow = document.getElementById('bed-settings-duration-row');
   const autoInput = document.getElementById('bed-settings-auto');
 
   if (!dev || !valve) {
     intervalSelect.innerHTML = intervalDaysOptions(1);
     volumeInput.value = '0.0';
+    durationInput.value = 60;
+    volumeRow.style.display = '';
+    durationRow.style.display = 'none';
     autoInput.checked = false;
     return;
   }
-  const sched = (dev.valveSchedules && dev.valveSchedules[valve - 1]) || { intervalDays: 1, volumeL: 0, autoEnabled: false };
+  const sched = (dev.valveSchedules && dev.valveSchedules[valve - 1]) || { intervalDays: 1, volumeL: 0, durationSec: 0, autoEnabled: false };
   intervalSelect.innerHTML = intervalDaysOptions(sched.intervalDays);
   volumeInput.value = sched.volumeL.toFixed(1);
+  durationInput.value = sched.durationSec;
   autoInput.checked = !!sched.autoEnabled;
+
+  const isDosing = dev.mode === 3;
+  volumeRow.style.display = isDosing ? '' : 'none';
+  durationRow.style.display = isDosing ? 'none' : '';
 }
 
 function openBedSettingsModal(id) {
@@ -1871,7 +1936,12 @@ async function saveBedSettings(btn) {
   const deviceIdx = deviceSelect.value;
   const valve = valveSelect.value;
   const interval = document.getElementById('bed-settings-interval').value;
+  // В DOM есть ОБА поля (видимое и скрытое, см. renderBedScheduleFields() выше - она
+  // заполняет их ОБА значениями из sched, а не только видимое), поэтому их можно
+  // взять напрямую - без дополнительного обращения к devicesByIdx (тот же принцип, что и у
+  // saveValveSchedule() выше, просто там одного из полей вообще нет в DOM, а здесь оно просто скрыто).
   const volume = document.getElementById('bed-settings-volume').value;
+  const duration = document.getElementById('bed-settings-duration').value;
   const autoEnabled = document.getElementById('bed-settings-auto').checked ? 1 : 0;
 
   try {
@@ -1885,7 +1955,7 @@ async function saveBedSettings(btn) {
       method: 'POST',
       headers: {'Content-Type': 'application/x-www-form-urlencoded'},
       body: 'idx=' + deviceIdx + '&valve=' + valve + '&intervalDays=' + interval +
-            '&volumeL=' + volume + '&autoEnabled=' + autoEnabled
+            '&volumeL=' + volume + '&durationSec=' + duration + '&autoEnabled=' + autoEnabled
     });
     if (bindRes.ok && schedRes.ok) {
       closeBedSettingsModal();

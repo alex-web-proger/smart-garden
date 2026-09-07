@@ -1008,33 +1008,39 @@ void handleApiRename() {
 }
 
 // POST /api/setValveSchedule - form-urlencoded: idx, valve, intervalDays (1..7), volumeL (десятичное
-// число литров, точность до десятых), autoEnabled (0/1). Настройки автополива клапана -
-// В ОТЛИЧИЕ от /api/setConfig (уходит на узел через ESP-NOW) - эти настройки ПОЛНОСТЬЮ локальны
-// для Самого Хаба (сам автополив по расписанию пока НЕ РЕАЛИЗОВАН - см. большой комментарий у
-// ValveSchedule в IrrigationDevice.h) - только сохраняются в NVS (см. DeviceManager::setValveSchedule()),
+// число литров, точность до десятых), durationSec (целое число секунд), autoEnabled (0/1).
+// Настройки автополива клапана - В ОТЛИЧИЕ от /api/setConfig (уходит на узел через ESP-NOW) - эти
+// настройки ПОЛНОСТЬЮ локальны для Самого Хаба (сам автополив по расписанию пока НЕ РЕАЛИЗОВАН - см. большой
+// комментарий у ValveSchedule в IrrigationDevice.h) - только сохраняются в NVS (см. DeviceManager::setValveSchedule()),
 // ничего узлу не отправляется. Доступно ТОЛЬКО для уже установленного устройства (та же
 // причина, что и у /api/rename выше - у кандидата эти настройки бессмысленны, он может быть
 // в любой момент вытеснен). volumeL приходит от браузера как десятичное число с точкой
 // (например, "2.5") - здесь переводится в целочисленные десятые литра (×10, с округлением до
 // ближайшего целого) перед сохранением - см. комментарий у volumeDl в ValveSchedule (IrrigationDevice.h),
-// почему хранится именно так.
+// почему хранится именно так. durationSec, в отличие от volumeL, целое число - пересчёта не требует.
+// ОБА поля всегда требуются и сохраняются ОДНОВРЕМЕННО, независимо от текущего mode устройства -
+// какое из них имеет смысл прямо сейчас, решает веб-страница при отображении (см. большой
+// комментарий у ValveSchedule в IrrigationDevice.h) - она же отправляет обратно неактуальное сейчас поле
+// тем же значением, что и получила (см. WebPage.h), а НЕ нулём/произвольным значением.
 void handleApiSetValveSchedule() {
     if (!server.hasArg("idx") || !server.hasArg("valve") || !server.hasArg("intervalDays") ||
-        !server.hasArg("volumeL") || !server.hasArg("autoEnabled")) {
-        server.send(400, "text/plain", "missing idx, valve, intervalDays, volumeL or autoEnabled");
+        !server.hasArg("volumeL") || !server.hasArg("durationSec") || !server.hasArg("autoEnabled")) {
+        server.send(400, "text/plain", "missing idx, valve, intervalDays, volumeL, durationSec or autoEnabled");
         return;
     }
     int idx = server.arg("idx").toInt();
     int valve = server.arg("valve").toInt();
     int intervalDays = server.arg("intervalDays").toInt();
     float volumeL = server.arg("volumeL").toFloat();
+    int durationSec = server.arg("durationSec").toInt();
     int autoEnabled = server.arg("autoEnabled").toInt();
-    if (intervalDays < 1 || intervalDays > 7 || volumeL < 0 || volumeL > 1000) {
-        server.send(400, "text/plain", "invalid intervalDays or volumeL");
+    if (intervalDays < 1 || intervalDays > 7 || volumeL < 0 || volumeL > 1000 ||
+        durationSec < 0 || durationSec > 86400) {
+        server.send(400, "text/plain", "invalid intervalDays, volumeL or durationSec");
         return;
     }
     uint16_t volumeDl = (uint16_t) (volumeL * 10.0f + 0.5f); // округление до ближайшего целого, а не обрезание вниз
-    if (!deviceManager.setValveSchedule(idx, valve, (uint8_t) intervalDays, volumeDl, autoEnabled != 0)) {
+    if (!deviceManager.setValveSchedule(idx, valve, (uint8_t) intervalDays, volumeDl, (uint16_t) durationSec, autoEnabled != 0)) {
         server.send(404, "text/plain", "device not found, not installed, not irrigation, or invalid valve");
         return;
     }
