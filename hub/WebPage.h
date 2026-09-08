@@ -165,13 +165,42 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
      .valve-state.open/.closed в модалке устройства. Задизейблена (тускло-серая), если модуль
      сейчас не резолвится (забыт) - см. updateBedCard() в скрипте. */
   .bed-controls { display:flex; align-items:center; gap:10px; margin-top:10px; }
-  .bed-toggle-btn { width:44px; height:44px; border-radius:50%; border:none; cursor:pointer;
-                     flex:0 0 auto; display:flex; align-items:center; justify-content:center; padding:0;
+  /* Обёртка кнопки полива + кольцевой индикатор прогресса вокруг неё (см. .bed-progress-ring
+     ниже) - фиксированного размера чуть больше самой кнопки (52 vs 44px), чтобы кольцо было
+     видно по периметру. position:relative - чтобы кольцо (position:absolute) позиционировалось
+     относительно этой обёртки, а не всей карточки. */
+  .bed-toggle-wrap { position:relative; width:52px; height:52px; flex:0 0 auto; }
+  .bed-toggle-btn { position:absolute; top:4px; left:4px; width:44px; height:44px; border-radius:50%; border:none; cursor:pointer;
+                     display:flex; align-items:center; justify-content:center; padding:0;
                      background:#8a97a3; box-shadow:0 1px 3px rgba(0,0,0,0.2); }
   .bed-toggle-btn svg { width:22px; height:22px; fill:#fff; }
   .bed-toggle-btn.bed-toggle-on { background:#2a7d2a; }
   .bed-toggle-btn:disabled { background:#ccc; cursor:not-allowed; box-shadow:none; }
   .bed-toggle-label { font-size:0.78em; color:#666; }
+
+  /* --- Кольцевой индикатор прогресса полива (см. большой комментарий у bedWatering в скрипте
+     ниже) - SVG-кольцо вокруг круглой кнопки полива, ЗАЛИВАЕТСЯ по часовой стрелке по мере
+     прохождения полива (доля прошедшего времени/вылитого объёма от заданного). transform:rotate(-90deg)
+     на самом <svg> - чтобы заливка начиналась строго СВЕРХУ (у SVG-круга 0° по умолчанию
+     справа), а не сбоку. r=22, stroke-width=3 - окружность (2*PI*22 ≈ 138.2, см.
+     PROGRESS_RING_CIRCUMFERENCE в скрипте) задана через stroke-dasharray здесь же (константа,
+     менять нечем) - JS меняет только stroke-dashoffset на каждый тик (см. updateBedProgressRing()
+     в скрипте). Скрыто (opacity:0) по умолчанию - показывается, только пока есть локально
+     отслеживаемый полив ЭТОЙ вкладки браузера (см. bedWatering/updateBedProgressRing() в скрипте) -
+     opacity, а не display:none, чтобы переход появления/исчезания был плавным (transition ниже). */
+  .bed-progress-ring { position:absolute; top:0; left:0; width:52px; height:52px;
+                        transform:rotate(-90deg); pointer-events:none;
+                        opacity:0; transition:opacity 0.3s ease; }
+  .bed-progress-ring.bed-progress-ring-visible { opacity:1; }
+  .bed-progress-ring-bg { fill:none; stroke:#d8e6c8; stroke-width:3; }
+  .bed-progress-ring-fg { fill:none; stroke:#2a6fa3; stroke-width:3; stroke-linecap:round;
+                           stroke-dasharray:138.2; stroke-dashoffset:138.2;
+                           transition:stroke-dashoffset 0.4s linear, stroke 0.3s ease; }
+  /* Завершившийся АВТОМАТИЧЕСКИ полив (кольцо застыло на 100%, см. большой комментарий у
+     bedWatering в скрипте) - зелёное кольцо, тот же цвет, что и у включённой кнопки
+     (.bed-toggle-on выше), вместо синего "в процессе" - чтобы визуально сразу читалось как
+     "выполнено", а не "всё ещё льётся". */
+  .bed-progress-ring-fg.bed-progress-ring-done { stroke:#2a7d2a; }
 
   .device-card { position:relative; background:#fff; border-radius:10px; padding:14px 50px 14px 14px;
                  border:2px solid transparent; box-shadow:0 1px 3px rgba(0,0,0,0.07); cursor:default; }
@@ -553,6 +582,22 @@ let bedCardsById = {};
 // devicesByIdx выше) - нужно, чтобы открыть модалку "Настройки грядки" без
 // отдельного похода в сеть (см. openBedSettingsModal() ниже).
 let bedsByIdx = {};
+
+// id грядки -> локальное (ТОЛЬКО в ПАМЯТИ ЭТОЙ ВКЛАДКИ БРАУЗЕРА, Хаб об этом ничего не
+// знает) состояние отслеживания текущего полива для кольцевого индикатора прогресса на
+// карточке грядки (см. .bed-progress-ring в стилях выше) - большой комментарий у
+// updateBedProgressRing() ниже объясняет, как оно строится/сбрасывается и почему оно
+// принципиально локальное, а не хранимое на Хабе - у САМОГО ХАБА нет понятия "процента
+// выполнения текущего полива", только activeValvesMask (открыт/закрыт) и, при датчике
+// потока, накопленный ВСЕГО объём с момента включения узла (totalWaterUsed).
+let bedWatering = {};
+
+// Длина окружности кольцевого индикатора (2*PI*r, r=22 - см. r="22" у .bed-progress-ring-fg в
+// createBedCard()) - то же число, что задано как stroke-dasharray в CSS (.bed-progress-ring-fg в
+// стилях выше) - используется как ПОЛНОЕ значение stroke-dashoffset (0% = весь этот
+// отступ, т.е. кольцо пустое; 100% = отступ 0, кольцо залито целиком) - см.
+// updateBedProgressRing() ниже.
+const PROGRESS_RING_CIRCUMFERENCE = 2 * Math.PI * 22;
 
 function openHubModal() {
   hubModalOpen = true;
@@ -1490,14 +1535,112 @@ function createBedCard(b) {
     '<div class="bed-crop"></div>' +
     '<div class="bed-line"></div>' +
     '<div class="bed-controls">' +
-      '<button class="bed-toggle-btn" title="Включить/выключить полив">' +
-        '<svg viewBox="0 0 24 24"><path d="M12 2C12 2 5 10.5 5 15a7 7 0 0 0 14 0c0-4.5-7-13-7-13z"/></svg>' +
-      '</button>' +
+      '<div class="bed-toggle-wrap">' +
+        '<svg class="bed-progress-ring" viewBox="0 0 52 52">' +
+          '<circle class="bed-progress-ring-bg" cx="26" cy="26" r="22"></circle>' +
+          '<circle class="bed-progress-ring-fg" cx="26" cy="26" r="22"></circle>' +
+        '</svg>' +
+        '<button class="bed-toggle-btn" title="Включить/выключить полив">' +
+          '<svg viewBox="0 0 24 24"><path d="M12 2C12 2 5 10.5 5 15a7 7 0 0 0 14 0c0-4.5-7-13-7-13z"/></svg>' +
+        '</button>' +
+      '</div>' +
       '<span class="bed-toggle-label"></span>' +
     '</div>';
   el.querySelector('.bed-gear-btn').addEventListener('click', () => openBedSettingsModal(b.id));
   el.querySelector('.bed-toggle-btn').addEventListener('click', () => toggleBedIrrigation(b.id));
   return el;
+}
+
+// Обновляет кольцевой индикатор прогресса полива вокруг круглой кнопки грядки (см.
+// .bed-progress-ring в стилях выше) - целиком ЛОКАЛЬНОЕ состояние этой вкладки браузера
+// (bedWatering выше), Хаб НИЧЕГО о прогрессе не знает и не хранит - у него просто нет
+// самого понятия "на сколько процентов выполнен текущий полив", только факт "клапан
+// сейчас открыт/закрыт" (activeValvesMask) и, при датчике потока, накопленный ВСЕГО
+// объём с момента включения узла (totalWaterUsed, В ЦЕЛЫХ ЛИТРАХ - см. IrrigationTelemetry в
+// GardenProtocol.h) - поэтому вся арифметика процента ниже основана на том, что САМА СТРАНИЦА
+// запомнила в момент старта полива (см. toggleBedIrrigation() ниже, именно там заводится/
+// удаляется запись bedWatering[b.id]).
+//
+// ДВА РЕЖИМА ПРОГРЕССА, СИММЕТРИЧНО ДВУМ РЕЖИМАМ АВТОЗАКРЫТИЯ НА УЗЛЕ (см. checkDurationTimeouts()/
+// checkDosing() в flow_node.ino): 'time' - доля прошедшего времени от заданной
+// продолжительности (durationSec, mode 1/2), 'volume' - доля вылитого объёма от заданного
+// (mode 3, точная дозировка). volume-режим ГРУБЕЕ (телеметрия отдаёт totalWaterUsed ТОЛЬКО в
+// целых литрах, см. fillTelemetry() в flow_node.ino) - для доз меньше литра прогресс может
+// скакнуть сразу с 0% на 100% одним тиком телеметрии, а не идти плавно - известное
+// ограничение текущей телеметрии, не этого индикатора.
+//
+// АВТОМАТИЧЕСКОЕ ЗАВЕРШЕНИЕ ("остаться на 100%"): если клапан был открыт (bedWatering[b.id]
+// существует и ещё не completed) и на этом же тике refreshBeds() внезапно оказался закрыт -
+// значит, его закрыл САМ УЗЕЛ (по времени/объёму, см. flow_node.ino) или сработал watchdog - В
+// ЛЮБОМ СЛУЧАЕ НЕ явное закрытие кнопкой этой же карточки (toggleBedIrrigation() при РУЧНОМ
+// выключении удаляет запись bedWatering[b.id] СРАЗУ, СИНХРОННО, ДО отправки команды - см.
+// там - то есть к моменту, когда сюда придёт очередной refreshBeds(), записи уже не будет, и веточка
+// ниже не сработает). Поэтому запись просто помечается completed=true (а не удаляется) - кольцо
+// остаётся залитым на 100% (и красится в зелёный - см. .bed-progress-ring-done в стилях), пока
+// оператор не запустит полив этой же грядки заново (тогда toggleBedIrrigation() перепишет всю
+// запись заново).
+//
+// ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ: состояние живёт только в памяти ЭТОЙ вкладки, не переживает её
+// перезагрузку и не синхронизировано между несколькими одновременно открытыми вкладками/
+// устройствами оператора - открыв страницу заново после того, как полив уже шёл, кольцо
+// начнёт отслеживать его "с нуля" (или не покажется вовсе, если полив к этому моменту уже
+// закрылся) - у Хаба просто нет соответствующего состояния, которое можно было бы
+// подтянуть вместо этого (см. большой абзац выше).
+function updateBedProgressRing(el, b, dev, isOpen) {
+  const ring = el.querySelector('.bed-progress-ring');
+  const fg = el.querySelector('.bed-progress-ring-fg');
+  let w = bedWatering[b.id];
+
+  if (isOpen) {
+    if (!w) {
+      // Полив уже идёт, но локальной записи нет - либо страница только что
+      // загрузилась/переоткрылась во время уже идущего полива, либо его включили с
+      // другой вкладки/устройства оператора (см. "ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ" в комментарии
+      // выше). Заводим НАИЛУЧШУЮ ОЦЕНКУ прямо сейчас, отсчитывая "старт" от текущего
+      // момента и беря заданный объём/продолжительность из СОБСТВЕННОГО расписания грядки
+      // (dev.valveSchedules[b.valve-1]) - то же самое значение, которое реально отправила бы кнопка
+      // "Полить" (см. toggleBedIrrigation() ниже) - реальный прогресс может быть уже больше,
+      // чем покажет кольцо (оно "не знает", что полив на самом деле идёт не с этой секунды), но
+      // это лучше, чем не показывать вообще ничего.
+      const sched = (dev.valveSchedules && dev.valveSchedules[b.valve - 1]) || {};
+      if (dev.mode === 3) {
+        w = { mode: 'volume', startVolumeL: dev.totalWaterUsed,
+              targetVolumeL: (sched.volumeL > 0 ? sched.volumeL : 1.0), completed: false };
+      } else {
+        w = { mode: 'time', startMs: Date.now(),
+              durationSec: (sched.durationSec > 0 ? sched.durationSec : 60), completed: false };
+      }
+      bedWatering[b.id] = w;
+    }
+  } else if (w && !w.completed) {
+    // Клапан только что оказался закрыт, а локальная запись ещё считалась активной -
+    // автозакрытие на самой платке (по времени/объёму) или срабатывание watchdog, см.
+    // большой комментарий у функции выше. Замораживаем на 100%, а не удаляем запись.
+    w.completed = true;
+  }
+
+  if (!w) {
+    // Ни разу не отслеживался (или уже успешно закрыт вручную - toggleBedIrrigation()
+    // удаляет запись синхронно при ручном выключении, см. там) - кольцо просто скрыто.
+    ring.classList.remove('bed-progress-ring-visible');
+    return;
+  }
+
+  let percent;
+  if (w.completed) {
+    percent = 100; // застыло на 100%, см. большой комментарий у функции выше
+  } else if (w.mode === 'volume') {
+    const dispensed = dev.totalWaterUsed - w.startVolumeL;
+    percent = w.targetVolumeL > 0 ? (dispensed / w.targetVolumeL) * 100 : 0;
+  } else {
+    const elapsedSec = (Date.now() - w.startMs) / 1000;
+    percent = w.durationSec > 0 ? (elapsedSec / w.durationSec) * 100 : 0;
+  }
+  percent = Math.max(0, Math.min(100, percent));
+
+  ring.classList.add('bed-progress-ring-visible');
+  fg.style.strokeDashoffset = String(PROGRESS_RING_CIRCUMFERENCE * (1 - percent / 100));
+  fg.classList.toggle('bed-progress-ring-done', w.completed);
 }
 
 // Обновляет содержимое карточки грядки. Фон/рамка теперь всегда одинаковы
@@ -1523,7 +1666,18 @@ function updateBedCard(el, b) {
     toggleBtn.disabled = false;
     toggleBtn.classList.toggle('bed-toggle-on', isOpen);
     toggleBtn.title = isOpen ? 'Закрыть полив' : 'Открыть полив';
-    toggleLabel.textContent = isOpen ? 'Полив включён' : 'Полив выключен';
+
+    updateBedProgressRing(el, b, dev, isOpen);
+    const w = bedWatering[b.id];
+    if (isOpen) {
+      toggleLabel.textContent = 'Полив включён';
+    } else if (w && w.completed) {
+      // Кольцо застыло на 100% (см. updateBedProgressRing()) - подпись должна объяснять,
+      // почему кнопка серая (выключена), а кольцо всё равно залито целиком.
+      toggleLabel.textContent = 'Полив выполнен';
+    } else {
+      toggleLabel.textContent = 'Полив выключен';
+    }
   } else {
     lineEl.textContent = 'Модуль #' + b.deviceIdx + ' не найден (забыт/переустановлен)';
     lineEl.classList.add('bed-line-missing');
@@ -1532,6 +1686,10 @@ function updateBedCard(el, b) {
     toggleBtn.classList.remove('bed-toggle-on');
     toggleBtn.title = 'Модуль недоступен';
     toggleLabel.textContent = 'Модуль недоступен';
+    // Модуль пропал (забыт/переустановлен) - прогрессу больше неоткуда брать данные (dev отсутствует) -
+    // просто скрываем кольцо, если оно было видно (локальную запись bedWatering не трогаем - если
+    // модуль вернётся, прогресс продолжит отсчёт там же, где остановился).
+    el.querySelector('.bed-progress-ring').classList.remove('bed-progress-ring-visible');
   }
 }
 
@@ -1563,14 +1721,25 @@ async function toggleBedIrrigation(id) {
 
   const isOpen = ((dev.activeValvesMask >> (b.valve - 1)) & 1) === 1;
   if (isOpen) {
+    // РУЧНОЕ выключение - удаляем локальную запись отслеживания прогресса ДО отправки команды (см.
+    // большой комментарий у updateBedProgressRing() выше) - именно это отличает ручную
+    // остановку от автоматического завершения: когда очередной refreshBeds() увидит клапан
+    // закрытым, записи уже не будет, и кольцо просто скроется, а не застынет на 100%.
+    delete bedWatering[id];
     await sendCmd(b.deviceIdx, b.valve, 1, 0, 0, 0);
   } else {
     const sched = dev.valveSchedules && dev.valveSchedules[b.valve - 1];
     if (dev.mode === 3) {
       const liters = (sched && sched.volumeL > 0) ? sched.volumeL : 1.0;
+      // Заводим отслеживание прогресса ДО отправки команды - точка отсчёта объёма (см.
+      // updateBedProgressRing() выше) - именно totalWaterUsed НА МОМЕНТ СТАРТА, а не на момент
+      // первого refreshBeds() после старта (иначе терялся бы объём, вылитый за первые до ~2 сек до
+      // следующего тика автообновления).
+      bedWatering[id] = { mode: 'volume', startVolumeL: dev.totalWaterUsed, targetVolumeL: liters, completed: false };
       await sendCmd(b.deviceIdx, b.valve, 0, 2, 0, liters);
     } else {
       const sec = (sched && sched.durationSec > 0) ? sched.durationSec : 60;
+      bedWatering[id] = { mode: 'time', startMs: Date.now(), durationSec: sec, completed: false };
       await sendCmd(b.deviceIdx, b.valve, 0, 0, sec, 0);
     }
   }
