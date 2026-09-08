@@ -86,6 +86,19 @@ uint32_t doseStartMl = 0;   // снимок totalWaterUsedMl на момент �
                              // текущего дозирования), checkDosing() сравнивает С РАЗНИЦЕЙ
                              // (totalWaterUsedMl - doseStartMl) с doseTargetMl, а не totalWaterUsedMl напрямую.
 
+// --- Автоматическое закрытие клапана по истечении заданного времени (IrrigationCommand.duration_sec,
+// открытие с mode!=2) - симметрично дозированию по объёму (doseActive/checkDosing() выше), но
+// ОТДЕЛЬНО НА КАЖДЫЙ КЛАПАН, а не одна общая переменная, как doseActive - потому что в независимом
+// режиме (configuredMode==2) несколько клапанов могут быть открыты ОДНОВРЕМЕННО, каждый со своим
+// собственным duration_sec, пришедшим в разное время. Индекс i соответствует клапану (i+1) - тот же
+// сдвиг, что и у activeValvesMask/emulatedFlowMlPerMin выше. Значение - момент millis(), в который
+// нужно закрыть клапан; 0 означает "нет активного таймера на этом клапане" (клапан либо закрыт, либо
+// был открыт БЕЗ ограничения по времени - duration_sec==0 в команде, та же семантика "открыт бессрочно,
+// до явной команды закрытия", что действовала и до появления этого механизма - см. checkDurationTimeouts()
+// ниже и её вызов из onCommand()). Клапан, управляемый через дозирование (mode==2), сюда никогда не
+// попадает - см. onCommand() ниже, там таймер выставляется только в ветке mode!=2.
+uint32_t valveCloseAtMs[MAX_VALVES] = {0};
+
 // --- Конфигурация, задаваемая Хабом (MSG_SET_CONFIG) - объявлена ЗДЕСЬ, выше блока
 // датчика потока ниже (вместо своего обычного места рядом с saveConfig()/loadConfig() ниже),
 // потому что updateFlowEmulation()/processFlowPulses() читают configuredHasFlowSensor/
@@ -251,6 +264,44 @@ void checkDosing() {
     node.sendTelemetryNow();
 }
 
+// Закрывает клапаны, у которых истекло собственное время работы (valveCloseAtMs[], см. большой
+// комментарий там же) - аналог checkDosing() выше, но по времени, а не по объёму, и на каждый
+// клапан отдельно. Вызывается из loop() каждую итерацию (сама проверка предельно дешёвая -
+// сравнение millis() с сохранённым значением, троттлить как processFlowPulses() незачем). Порядок вызова
+// относительно checkDosing() не важен - дозируемый клапан (mode==2) никогда не попадает в
+// valveCloseAtMs (см. onCommand() ниже), поэтому одна и та же линия не может истечь по обоим
+// механизмам сразу.
+void checkDurationTimeouts() {
+    uint32_t now = millis();
+    for (uint8_t i = 0; i < MAX_VALVES; i++) {
+        if (valveCloseAtMs[i] == 0) continue; // нет активного таймера на этом клапане
+
+        // Сравнение через разность с приведением к int32_t (а не прямое "now >= valveCloseAtMs[i]") -
+        // корректно обрабатывает переполнение millis() (~49.7 дня) - тот же приём, что и elapsedMs в
+        // processFlowPulses()/updateFlowEmulation() выше, просто в форме "цель ещё не наступила", а не сколько
+        // прошло. Допустимо, поскольку все длительности полива в проекте (до 24 часов, см. валидацию
+        // durationSec в handleApiSetValveSchedule() в hub.ino) на порядок меньше половины диапазона int32_t.
+        if ((int32_t) (now - valveCloseAtMs[i]) < 0) continue;
+
+        uint8_t bit = (uint8_t) (1 << i);
+        valveCloseAtMs[i] = 0; // таймер снимаем в любом случае - свою задачу он выполнил
+        if (!(activeValvesMask & bit)) {
+            // Клапан уже закрыт другим путём (явная команда close, смена конфигурации, watchdog) -
+            // закрывать нечего.
+            continue;
+        }
+
+        activeValvesMask &= ~bit;
+        applyValveState(activeValvesMask);
+        Serial.printf("Клапан %u закрыт автоматически: истекло заданное время полива\n", i + 1);
+
+        if (activeValvesMask == 0) node.disarmWatchdog();
+        // Тот же принцип, что и у остальных автоматических закрытий состояния (checkDosing()/
+        // onWatchdogTimeout()) - Xаб должен узнать об этом сразу, а не ждать следующего планового тика телеметрии.
+        node.sendTelemetryNow();
+    }
+}
+
 // --- Конфигурация, задаваемая Хабом (MSG_SET_CONFIG) и хранимая на самом
 // узле в EEPROM - переживает перезагрузку, в отличие от activeValvesMask выше.
 // Сами переменные configuredValveCount/configuredMode/configuredHasFlowSensor/
@@ -375,9 +426,18 @@ uint8_t onCommand(const UniversalPacket &pkt) {
         if (cmd.target_valve == 0) {
             activeValvesMask = 0;
             doseActive = false;
+            // Закрываем всё сразу - снимаем и все таймеры автозакрытия по времени (см. valveCloseAtMs
+            // выше) - иначе checkDurationTimeouts() позже попытался бы снова закрыть уже закрытый/переиспользованный
+            // позже клапан.
+            for (uint8_t i = 0; i < MAX_VALVES; i++) valveCloseAtMs[i] = 0;
         } else {
             activeValvesMask &= ~(uint8_t) (1 << (cmd.target_valve - 1));
             if (doseActive && doseValve == cmd.target_valve) doseActive = false;
+            // Снимаем таймер автозакрытия по времени именно этого клапана - клапан уже закрыт
+            // явной командой прямо сейчас, без этого checkDurationTimeouts() позже попытался бы снова закрыть
+            // уже закрытый клапан или, ещё хуже, какую-то другую линию, если оператор успел вновь
+            // открыть тот же номер до того, как таймер старой команды истёк.
+            valveCloseAtMs[cmd.target_valve - 1] = 0;
         }
     } else { // ACTION_OPEN
         if (cmd.target_valve == 0) {
@@ -408,6 +468,11 @@ uint8_t onCommand(const UniversalPacket &pkt) {
             doseValve = cmd.target_valve;
             doseTargetMl = (uint32_t) cmd.volume_dl * 100UL; // десятые литра -> мл
             doseStartMl = totalWaterUsedMl;
+            // Дозирование форсированно эксклюзивно (activeValvesMask = bit выше) - все другие клапаны уже
+            // физически закрыты этой строкой - если на каком-то из них ещё тикал таймер автозакрытия по
+            // времени (valveCloseAtMs) - его нужно снять, чтобы checkDurationTimeouts() не попытался позже
+            // закрыть уже закрытый (или переиспользованный под другую линию) клапан.
+            for (uint8_t i = 0; i < MAX_VALVES; i++) valveCloseAtMs[i] = 0;
             Serial.printf("Дозирование запущено: клапан=%u целевой объём=%u.%u л\n",
                           cmd.target_valve, cmd.volume_dl / 10, cmd.volume_dl % 10);
         } else {
@@ -419,18 +484,41 @@ uint8_t onCommand(const UniversalPacket &pkt) {
                 // ЛЮБОГО клапана автоматически закрывает все остальные - исходное
                 // поведение проекта.
                 activeValvesMask = bit;
+                // То же самое, что и в ветке дозирования выше: эксклюзивное открытие физически закрывает
+                // все остальные клапаны - снимаем и их таймеры автозакрытия (valveCloseAtMs), чтобы
+                // checkDurationTimeouts() позже не попытался закрыть уже закрытую/переиспользованную линию.
+                for (uint8_t i = 0; i < MAX_VALVES; i++) valveCloseAtMs[i] = 0;
             } else {
                 // Режим 2 (независимый) - открытие этого клапана НЕ трогает
-                // состояние остальных.
+                // состояние остальных (и их таймеры автозакрытия тоже не трогаем).
                 activeValvesMask |= bit;
+            }
+
+            // --- Автозакрытие ПО ВРЕМЕНИ (duration_sec, в дополнение к автозакрытию по объёму
+            // в ветке дозирования выше) - см. большой комментарий у valveCloseAtMs в начале файла.
+            // duration_sec==0 сохраняет прежнее поведение "открыт бессрочно, до явной команды закрытия/
+            // срабатывания watchdog" - нужно, например, для ручных кнопок "Открыть"/"Закрыть" в
+            // модалке устройства веб-интерфейса, если там когда-нибудь появится вариант без длительности.
+            // Сам веб-интерфейс сейчас всегда присылает положительную длительность (кнопка грядки и поле
+            // длительности в модалке устройства всегда >0, см. WebPage.h), но протокол это число не
+            // требует (см. IrrigationCommand.duration_sec в GardenProtocol.h) - поэтому здесь проверяется явно.
+            // Неважно, что cmd.target_valve уже проверен в начале функции на принадлежность
+            // configuredValveCount<=MAX_VALVES, поэтому индекс ниже всегда в границах массива.
+            if (cmd.duration_sec > 0) {
+                valveCloseAtMs[cmd.target_valve - 1] = millis() + (uint32_t) cmd.duration_sec * 1000UL;
+            } else {
+                valveCloseAtMs[cmd.target_valve - 1] = 0;
             }
         }
     }
 
     // Реальное управление GPIO. Для легаси-mode==1 (полив по объёму в целых
     // литрах, дозировка команды - не путать с configuredMode) расчёт по датчику потока
-    // так и не реализован - клапан просто открывается и остаётся открытым, как при mode==0 без
-    // таймера (TODO). Для mode==2 (точная дозировка) автоматическое закрытие по
+    // так и не реализован - клапан просто открывается, но теперь всё равно закроется сам по истечению
+    // duration_sec, как и обычный mode==0 (см. ветку ACTION_OPEN выше, где выставляется valveCloseAtMs, и
+    // checkDurationTimeouts() ниже) - только ограничения по объёму (volume_l) у этой легаси-команды нет и
+    // не планируется - mode==2 (точная дозировка по volume_dl) полностью закрывает эту потребность.
+    // Для mode==2 (точная дозировка) автоматическое закрытие по
     // достижению цели выполняет checkDosing() ниже (вызывается из loop()), а не эта функция.
     applyValveState(activeValvesMask);
 
@@ -513,6 +601,11 @@ uint8_t onSetConfig(const UniversalPacket &pkt) {
         applyValveState(activeValvesMask);
         node.sendTelemetryNow();
     }
+    // Клапаны за пределами нового valve_count больше недоступны (см. проверку в начале onCommand()) -
+    // снимаем и их таймеры автозакрытия по времени (valveCloseAtMs) - безотлагательно, не только те,
+    // что были открыты, потому что checkDurationTimeouts() иначе мог бы позже найти таймер на номере,
+    // который больше не существует по текущей конфигурации.
+    for (uint8_t i = configuredValveCount; i < MAX_VALVES; i++) valveCloseAtMs[i] = 0;
 
     // Если переключились в эксклюзивный (mode=1) или дозирующий (mode=3, он всегда
     // ведёт себя как эксклюзивный для открытия клапанов, см. IrrigationSpec.mode в
@@ -524,6 +617,9 @@ uint8_t onSetConfig(const UniversalPacket &pkt) {
         activeValvesMask = 0;
         applyValveState(0);
         node.sendTelemetryNow();
+        // Всё закрыто форсированно - снимаем и все таймеры автозакрытия по времени (valveCloseAtMs) -
+        // та же причина, что и в аналогичных местах в onCommand() выше.
+        for (uint8_t i = 0; i < MAX_VALVES; i++) valveCloseAtMs[i] = 0;
     }
 
     // Любое из двух принудительных закрытий выше могло затронуть бит дозируемого клапана -
@@ -541,6 +637,10 @@ uint8_t onSetConfig(const UniversalPacket &pkt) {
 void onWatchdogTimeout() {
     activeValvesMask = 0;
     doseActive = false; // потеря связи с Хабом обрывает и любое текущее дозирование, не только обычные клапаны
+    // То же самое и с таймерами автозакрытия по времени (valveCloseAtMs) - потеря связи закрывает все
+    // клапаны физически (applyValveState(0) ниже), без этого checkDurationTimeouts() позже попытался бы
+    // снова закрыть уже закрытый/переиспользованный к моменту срабатывания клапан.
+    for (uint8_t i = 0; i < MAX_VALVES; i++) valveCloseAtMs[i] = 0;
     applyValveState(0);
     // Аналогично onCommand() выше - автоматическое закрытие по watchdog
     // тоже реальное изменение состояния клапана, о котором Хаб должен
@@ -611,4 +711,5 @@ void loop() {
 #endif
     processFlowPulses(); // сам себя троттлит до FLOW_PROCESS_INTERVAL_MS, можно звать каждую итерацию
     checkDosing(); // ОБЯЗАТЕЛЬНО ПОСЛЕ processFlowPulses() - см. комментарий у неё
+    checkDurationTimeouts(); // автозакрытие по времени - не зависит от датчика потока, порядок относительно checkDosing() не важен
 }
