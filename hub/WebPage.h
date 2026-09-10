@@ -148,8 +148,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
               min-height:88px; display:flex; flex-direction:column; justify-content:space-between; }
   .bed-name { font-weight:600; font-size:1.05em; margin-bottom:4px; word-break:break-word; }
   .bed-crop { font-size:0.85em; color:#444; }
-  .bed-line { font-size:0.78em; color:#888; margin-top:6px; }
+  .bed-line { font-size:0.78em; color:#888; }
   .bed-line.bed-line-missing { color:#c0392b; }
+  /* Строка с точкой-индикатором связи перед описанием линии/модуля (.bed-line выше) - та же
+     точка .conn-dot/connInfo(), что и на вкладке "Устройства" (см. connInfo() в скрипте), чтобы
+     оператор видел отсутствие связи с модулем грядки ЕЩЁ ДО попытки нажать кнопку полива, а
+     не только после неудачного клика (см. updateBedCard()/toggleBedIrrigation() в скрипте). Сам цвет
+     (conn-ok/conn-warn/conn-bad) задаётся общими правилами .conn-dot.conn-* выше - своих цветов здесь нет. */
+  .bed-line-row { display:flex; align-items:center; gap:6px; margin-top:6px; }
   .bed-gear-btn { position:absolute; top:8px; right:8px; width:auto; height:auto; border-radius:0;
                   border:none; background:none; cursor:pointer; padding:0;
                   display:flex; align-items:center; justify-content:center;
@@ -1545,7 +1551,7 @@ function createBedCard(b) {
     '</button>' +
     '<div class="bed-name"></div>' +
     '<div class="bed-crop"></div>' +
-    '<div class="bed-line"></div>' +
+    '<div class="bed-line-row"><span class="conn-dot"></span><div class="bed-line"></div></div>' +
     '<div class="bed-controls">' +
       '<div class="bed-toggle-wrap">' +
         '<svg class="bed-progress-ring" viewBox="0 0 76 76">' +
@@ -1696,6 +1702,7 @@ function updateBedCard(el, b) {
 
   const dev = devicesByIdx[b.deviceIdx];
   const lineEl = el.querySelector('.bed-line');
+  const dotEl = el.querySelector('.conn-dot');
   const toggleBtn = el.querySelector('.bed-toggle-btn');
   const toggleLabel = el.querySelector('.bed-toggle-label');
   if (dev) {
@@ -1703,35 +1710,85 @@ function updateBedCard(el, b) {
     lineEl.textContent = devName + ' · линия ' + b.valve;
     lineEl.classList.remove('bed-line-missing');
 
+    // Связь с модулем - та же connInfo()/пороги что и на вкладке "Устройства" (см. connInfo()
+    // выше) - одна и та же точка связи, просто теперь ещё и на карточке грядки. conn-bad
+    // (agoSec >= 120, см. connInfo()) считаемся "нет связи" для целей управления ниже - этот же порог,
+    // что и в toggleBedIrrigation() ниже (там же объяснение, почему именно этот порог, а не conn-warn).
+    const conn = connInfo(dev.agoSec);
+    const offline = conn.cls === 'conn-bad';
+    dotEl.className = 'conn-dot ' + conn.cls;
+
     const isOpen = ((dev.activeValvesMask >> (b.valve - 1)) & 1) === 1;
-    toggleBtn.disabled = false;
+    // Отсутствие связи блокирует кнопку НАРАВНЕ с "модуль не найден" в ветке else ниже - отправлять
+    // команду узлу, который уже давно молчит, всё равно бессмысленно - она не дойдёт (или дойдёт, но
+    // оператор об этом всё равно не узнает - см. большой комментарий у PendingCommand в hub.ino), лучше
+    // честно не давать попытаться. Реактивная страховка на случай гонки (связь отвалилась ровно между
+    // этим опросом и кликом) - в toggleBedIrrigation() ниже.
+    toggleBtn.disabled = offline;
     toggleBtn.classList.toggle('bed-toggle-on', isOpen);
-    toggleBtn.title = isOpen ? 'Закрыть полив' : 'Открыть полив';
+    toggleBtn.title = offline ? 'Нет связи с модулем - управление невозможно' : (isOpen ? 'Закрыть полив' : 'Открыть полив');
 
     updateBedProgressRing(el, b, dev, isOpen);
     const w = bedWatering[b.id];
-    if (isOpen) {
-      toggleLabel.textContent = 'Полив включён';
-    } else if (w && w.completed) {
-      // Кольцо застыло на 100% (см. updateBedProgressRing()) - подпись должна объяснять,
-      // почему кнопка серая (выключена), а кольцо всё равно залито целиком.
-      toggleLabel.textContent = 'Полив выполнен';
-    } else {
-      toggleLabel.textContent = 'Полив выключен';
+    // Пока у подписи активен временный flash от flashBedOffline() (см. ниже, вызывается из
+    // toggleBedIrrigation() при клике во время отсутствия связи) - НЕ перезаписываем её текст обычным
+    // состоянием здесь - иначе очередной тик refreshBeds() (каждые 2 сек) смыл бы сообщение об
+    // отсутствии связи почти мгновенно после появления.
+    if (!toggleLabel._flashTimer) {
+      if (offline) {
+        toggleLabel.textContent = 'Нет связи с модулем';
+      } else if (isOpen) {
+        toggleLabel.textContent = 'Полив включён';
+      } else if (w && w.completed) {
+        // Кольцо застыло на 100% (см. updateBedProgressRing()) - подпись должна объяснять,
+        // почему кнопка серая (выключена), а кольцо всё равно залито целиком.
+        toggleLabel.textContent = 'Полив выполнен';
+      } else {
+        toggleLabel.textContent = 'Полив выключен';
+      }
     }
   } else {
     lineEl.textContent = 'Модуль #' + b.deviceIdx + ' не найден (забыт/переустановлен)';
     lineEl.classList.add('bed-line-missing');
+    // Модуля вообще нет в текущей таблице устройств - то же самое визуальное "нет связи", что и у
+    // оффлайн-модуля выше, хотя причина другая (забыли/переустановили, а не просто молчит) - отдельного
+    // цвета под этот случай заводить не стоит.
+    dotEl.className = 'conn-dot conn-bad';
 
     toggleBtn.disabled = true;
     toggleBtn.classList.remove('bed-toggle-on');
     toggleBtn.title = 'Модуль недоступен';
-    toggleLabel.textContent = 'Модуль недоступен';
+    if (!toggleLabel._flashTimer) toggleLabel.textContent = 'Модуль недоступен';
     // Модуль пропал (забыт/переустановлен) - прогрессу больше неоткуда брать данные (dev отсутствует) -
     // просто скрываем кольцо, если оно было видно (локальную запись bedWatering не трогаем - если
     // модуль вернётся, прогресс продолжит отсчёт там же, где остановился).
     el.querySelector('.bed-progress-ring').classList.remove('bed-progress-ring-visible');
   }
+}
+
+// Флаш-сообщение на подписи кнопки грядки (.bed-toggle-label) - тот же принцип, что и у flashButton()
+// выше (ненадолго меняет текст/цвет, потом возвращает как было), но НЕ САМ flashButton(): та функция
+// пишет в btn.textContent напрямую, а у кнопки грядки (.bed-toggle-btn) внутри - SVG-иконка, а не
+// текст, и такой вызов безвозвратно стёр бы её (btn.textContent = tempText уничтожил бы <svg>). Флашим вместо этого подпись под кнопкой
+// грядки (.bed-toggle-label, чисто текстовый <span>) - тот же FLASH_DURATION_MS и та же идея с таймером в свойстве элемента,
+// но свой CSS-класс (bed-toggle-label-err) вместо btn-flash-*, поскольку те завязаны CSS-селекторами именно на тег <button>.
+// Обычный текст после окончания flash восстанавливать НЕ НАДО - следующий тик refreshBeds() (каждые ≤ 2 сек,
+// см. setInterval ниже) сам пересчитает его через updateBedCard() выше (см. проверку !toggleLabel._flashTimer там) -
+// поэтому у этой функции,
+// в отличие от flashButton(), нет собственного dataset.origText/возврата текста по таймеру -
+// после истечения FLASH_DURATION_MS она просто снимает класс и обнуляет флаг, а какой
+// текст показать взамен - решает уже updateBedCard() на следующем обычном тике.
+function flashBedOffline(id) {
+  const card = bedCardsById[id];
+  if (!card) return; // карточка уже удалена (грядку успели удалить) - показывать flash негде
+  const label = card.querySelector('.bed-toggle-label');
+  label.textContent = 'Нет связи - команда не отправлена';
+  label.classList.add('bed-toggle-label-err');
+  if (label._flashTimer) clearTimeout(label._flashTimer);
+  label._flashTimer = setTimeout(() => {
+    label.classList.remove('bed-toggle-label-err');
+    label._flashTimer = null;
+  }, FLASH_DURATION_MS);
 }
 
 // Ручное включение/выключение полива круглой кнопкой на карточке грядки - переключает
@@ -1759,6 +1816,19 @@ async function toggleBedIrrigation(id) {
   if (!b) return;
   const dev = devicesByIdx[b.deviceIdx];
   if (!dev) return;
+
+  // Нет связи с модулем (тот же порог conn-bad, что и в updateBedCard() выше для дизейбла кнопки)
+  // - кнопка там уже должна быть заблокирована в этом случае, но эта проверка здесь всё равно нужна -
+  // если связь пропала ИМЕННО МЕЖДУ тиками refreshBeds() (кнопка всё ещё выглядит активной в
+  // РАЗМЕТКЕ, а реальное состояние disabled ещё не применилось), либо после
+  // тач-тапа на мобильном экране клик всё равно успевает дойти до обработчика до того, как
+  // браузер успеет перерисовать disabled-состояние кнопки - проверка здесь гарантирует,
+  // что команда не уйдёт в эфир впустую в обоих случаях.
+  const conn = connInfo(dev.agoSec);
+  if (conn.cls === 'conn-bad') {
+    flashBedOffline(id);
+    return;
+  }
 
   const isOpen = ((dev.activeValvesMask >> (b.valve - 1)) & 1) === 1;
   if (isOpen) {
